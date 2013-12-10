@@ -17,6 +17,7 @@
 /* For O_CLOEXEC */
 #include <linux/fcntl.h>
 #include <linux/types.h>
+#include <linux/poll.h>
 
 /* Flags for epoll_create1.  */
 #define EPOLL_CLOEXEC O_CLOEXEC
@@ -61,5 +62,10 @@ struct epoll_event {
 	__u64 data;
 } EPOLL_PACKED;
 
+struct epoll {
+	int ep_fildes; /* file descriptor */
+	int ep_events; /* triggering events */
+	long long ep_ident; /* entry ID (cf. epoll_event->data) */
+} EPOLL_PACKED; /* A.K.A. "epe" for "eventpoll entry" */
 
 #endif /* _UAPI_LINUX_EVENTPOLL_H */
