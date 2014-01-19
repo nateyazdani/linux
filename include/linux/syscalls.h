@@ -599,7 +599,7 @@ asmlinkage long sys_poll(struct pollfd __user *ufds, unsigned int nfds,
 asmlinkage long sys_select(int n, fd_set __user *inp, fd_set __user *outp,
 			fd_set __user *exp, struct timeval __user *tvp);
 asmlinkage long sys_old_select(struct sel_arg_struct __user *arg);
-asmlinkage long sys_epoll(int timeout);
+asmlinkage long sys_epoll(void);
 asmlinkage long sys_epoll_create(int size);
 asmlinkage long sys_epoll_create1(int flags);
 asmlinkage long sys_epoll_ctl(int epfd, int op, int fd,

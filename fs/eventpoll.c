@@ -911,6 +911,9 @@ static ssize_t ep_eventpoll_write(struct file *file, const char __user *buf,
 static ssize_t ep_eventpoll_read(struct file *file, char __user *buf,
 				 size_t bufsz, loff_t *pos);
 
+static int ep_eventpoll_ioctl(struct file *file, unsigned int cmd,
+			      unsigned long arg);
+
 /* File callbacks that implement the eventpoll file behaviour */
 static const struct file_operations eventpoll_fops = {
 #ifdef CONFIG_PROC_FS
@@ -920,6 +923,7 @@ static const struct file_operations eventpoll_fops = {
 	.poll		= ep_eventpoll_poll,
 	.read		= ep_eventpoll_read,
 	.write		= ep_eventpoll_write,
+	.unlocked_ioctl	= ep_eventpoll_ioctl,
 	.llseek		= noop_llseek,
 };
 
@@ -2001,11 +2005,12 @@ out:
 /**
  *
  * ep_eventpoll_read - Read triggered events from an epoll file, delivered to
- *		       userspace in 'struct epoll' packets. If the provided
- *		       buffer is ill-aligned, 
+ *		       userspace in 'struct epoll' packets. At most, as many
+ *		       events that wholly fit within the buffer are returned,
+ *		       with less being returned if the read times out.
  *
  * @file: The epoll file to retrieve events from.
- * @buf: Preallocated buffer into which the kernel will store epoll entries. 
+ * @buf: Preallocated buffer into which the kernel will store epoll entries.
  * @bufsz: Size of buffer, which ought to be in multiples of the epoll entry
  *	   structure. If not, the kernel will store as many structs as will
  *	   wholly fit within the provided buffer, not exceeding EP_MAX_EVENTS.
@@ -2034,14 +2039,14 @@ ssize_t ep_eventpoll_read(struct file *file, char __user *buf, size_t bufsz,
 }
 
 /**
- * ep_make_epoll - Make a new epoll file in the current process's file table.
+ * ep_make_epoll - Make a new epoll file in the current process's file table with
+ *		   an infinite timeout by default.
  *
  * @flags: Optional creation flags.
- * @timeout: Optional default timeout.
  *
  * Returns: Returns the file descriptor of the new epoll or negative error code.
  */
-static int ep_make_epoll(int flags, int timeout)
+static int ep_make_epoll(int flags)
 {
 	int error, fd;
 	struct eventpoll *ep = NULL;
@@ -2052,6 +2057,7 @@ static int ep_make_epoll(int flags, int timeout)
 
 	if (flags & ~EPOLL_CLOEXEC)
 		return -EINVAL;
+	flags |= O_RDWR;
 
 	/*
 	 * Create the internal data structure ("struct eventpoll").
@@ -2063,20 +2069,19 @@ static int ep_make_epoll(int flags, int timeout)
 	 * Creates all the items needed to setup an eventpoll file. That is,
 	 * a file structure and a free file descriptor.
 	 */
-	fd = get_unused_fd_flags(O_RDWR | (flags & O_CLOEXEC));
+	fd = get_unused_fd_flags(flags);
 	if (fd < 0) {
 		error = fd;
 		goto out_free_ep;
 	}
-	file = anon_inode_getfile("[eventpoll]", &eventpoll_fops, ep,
-				 O_RDWR | (flags & O_CLOEXEC));
+	file = anon_inode_getfile("[eventpoll]", &eventpoll_fops, ep, flags);
 	if (IS_ERR(file)) {
 		error = PTR_ERR(file);
 		goto out_free_fd;
 	}
 	ep->file = file;
 	fd_install(fd, file);
-	ep->timeout = timeout;
+	ep->timeout = -1;
 	return fd;
 
 out_free_fd:
@@ -2086,9 +2091,34 @@ out_free_ep:
 	return error;
 }
 
-SYSCALL_DEFINE1(epoll, int, timeout)
+/*
+ * ep_eventpoll_ioctl - configure an eventpoll's behavior.
+ *
+ * @cmd: An EPIOC_* control command.
+ * @arg: A pointer whose type depends on @cmd.
+ *
+ * Returns: 0 on success or an errno code.
+ */
+static int ep_eventpoll_ioctl(struct file *file, unsigned int cmd,
+			      unsigned long arg)
 {
-	return ep_make_epoll(O_CLOEXEC, timeout);
+	struct eventpoll *ep = file->private_data;
+	switch (cmd) {
+	case EPIOC_GETTIMEOUT:
+		return put_user(ep->timeout, (int __user *)arg);
+	case EPIOC_SETTIMEOUT:
+		return get_user(ep->timeout, (int __user *)arg);
+	default:
+		return -EINVAL;
+	}
+}
+
+/*
+ * Construct a new eventpoll and return its file descriptor. 
+ */
+SYSCALL_DEFINE(epoll)
+{
+	return ep_make_epoll(O_CLOEXEC);
 }
 
 /*
@@ -2096,8 +2126,7 @@ SYSCALL_DEFINE1(epoll, int, timeout)
  */
 SYSCALL_DEFINE1(epoll_create1, int, flags)
 {
-	/* ep_[p]wait() overrides default timeout, so just set it to zero. */
-	return ep_make_epoll(flags, 0);
+	return ep_make_epoll(flags);
 }
 
 SYSCALL_DEFINE1(epoll_create, int, size)
@@ -2105,13 +2134,13 @@ SYSCALL_DEFINE1(epoll_create, int, size)
 	if (size <= 0)
 		return -EINVAL;
 
-	return ep_make_epoll(0, 0);
+	return ep_make_epoll(0);
 }
 
 /*
  * The following function implements the controller interface for
  * the eventpoll file that enables the insertion/removal/change of
- * file descriptors inside the interest set.
+ * file descriptors inside the interest set. TODO: defer to write()
  */
 SYSCALL_DEFINE4(epoll_ctl, int, epfd, int, op, int, fd,
 		struct epoll_event __user *, event)

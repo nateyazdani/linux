@@ -57,6 +57,10 @@
 #define EPOLL_PACKED
 #endif
 
+/* ioctl() requests */
+#define EPIOC_GETTIMEOUT	_IOR(0, 0, int)
+#define EPIOC_SETTIMEOUT	_IOW(0, 1, int)
+
 struct epoll_event {
 	__u32 events;
 	__u64 data;
