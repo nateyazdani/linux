@@ -1662,7 +1662,7 @@ static int ep_send_epes(struct eventpoll *ep, void __user *buf, size_t bufsz)
 {
 	struct ep_send_epes_data esed = { .max = bufsz / sizeof(struct epoll),
 					  .epes = buf };
-	return ep_scan_ready_list(ep, ep_send_epes_proc, &esed, 0);
+	return ep_scan_ready_list(ep, ep_send_epes_proc, &esed, 0, false);
 }
 
 static inline struct timespec ep_set_mstimeout(long ms)
@@ -1901,6 +1901,7 @@ static ssize_t ep_eventpoll_write(struct file *file, const char __user *buf,
 	struct file *target;
 	const struct epoll __user *epes = (const struct epoll __user *)buf;
 	struct epoll epe;
+	bool fullchk;
 	size_t num = bufsz / sizeof(struct epoll); /* Ignore any extra */
 	int i;
 
@@ -1967,9 +1968,11 @@ static ssize_t ep_eventpoll_write(struct file *file, const char __user *buf,
 			if (ep_remove(ep, epi))
 				goto out_unlock_epmtx;
 		} else if (epe.ep_events && !epi) {
+			fullchk = !list_empty(&target->f_ep_links) ||
+				  is_file_epoll(target);
 			epe.ep_events |= POLLERR | POLLHUP;
 			if (ep_insert(ep, epe.ep_ident, epe.ep_events, target,
-				      epe.ep_fildes))
+				      epe.ep_fildes, fullchk))
 				goto out_unlock_epmtx;
 		} else if (epe.ep_events && epi) {
 			epe.ep_events |= POLLERR | POLLHUP;
