@@ -911,7 +911,7 @@ static ssize_t ep_eventpoll_write(struct file *file, const char __user *buf,
 static ssize_t ep_eventpoll_read(struct file *file, char __user *buf,
 				 size_t bufsz, loff_t *pos);
 
-static int ep_eventpoll_ioctl(struct file *file, unsigned int cmd,
+static long ep_eventpoll_ioctl(struct file *file, unsigned int cmd,
 			      unsigned long arg);
 
 /* File callbacks that implement the eventpoll file behaviour */
@@ -1880,11 +1880,11 @@ static void clear_tfile_check_list(void)
  * ep_eventpoll_write - Create, remove, or modify events to poll for. The epoll
  *			file distinguishes between events by file descriptor,
  *			but it will also store a user-defined identifier along
- *			with it. To modify an existing event, simply set ->ep_fd
- *			to the target file desciptor and set ->ep_id and
- *			->ep_io to whatever values you wish to change them to.
- *			To remove an event, set ->ep_fd to the relevant file
- *			descriptor and clear ->ep_io.
+ *			with it. To modify an existing event, simply set
+ *			->ep_fildes to the target file desciptor and set
+ *			->ep_ident and ->ep_events to whatever values you wish
+ *			to change them to. To remove an event, set ->ep_fildes
+ *			to the relevant file descriptor and clear ->ep_events.
  *
  * @file: The epoll file being acted upon.
  * @buf: Array of 'struct epoll' entries, to be inserted, modified, or removed
@@ -1893,26 +1893,30 @@ static void clear_tfile_check_list(void)
  *	   structure.
  * @pos: Ignored, epoll files behave like character devices.
  *
- * Returns: The number of bytes from the userspace buffer successfully processed
- *	    or an error code if the buffer is ill-aligned inaccessible
- *	    (nothing will have been processed).
+ * Returns: The number of bytes from the userspace buffer successfully processed,
+ *	    always a multiple of sizeof(struct epoll), or an error code if the
+ *	    buffer is ill-aligned or inaccessible (nothing will have been
+ *	    processed).
  */
 static ssize_t ep_eventpoll_write(struct file *file, const char __user *buf,
 				  size_t bufsz, loff_t *pos)
 {
-	struct eventpoll *ep = file->private_data;
+	struct eventpoll *ep = file->private_data, *tep = NULL;
 	struct epitem *epi;
 	struct file *target;
 	const struct epoll __user *epes = (const struct epoll __user *)buf;
 	struct epoll epe;
-	bool fullchk;
-	size_t num = bufsz / sizeof(struct epoll); /* Ignore any extra */
+	bool full_check = false;
+	size_t num = bufsz / sizeof(struct epoll); /* Ignore any excess */
 	int i;
+
+	if (!access_ok(VERIFY_READ, buf, bufsz))
+		return -EFAULT;
 
 	for (i = 0; i < num; ++i) {
 
 		if (copy_from_user(&epe, &epes[i], sizeof(struct epoll)))
-			return i ? i : -EFAULT;
+			goto out;
 
 		target = fget(epe.ep_fildes);
 		if (target < 0)
@@ -1930,72 +1934,88 @@ static ssize_t ep_eventpoll_write(struct file *file, const char __user *buf,
 		if (target == file)
 			goto out_fput;
 
-		/*
-		 * When we insert an epoll file descriptor, inside another epoll file
-		 * descriptor, there is the chance of creating closed loops, which are
-		 * better handled here, than in more critical paths. While we are
-		 * checking for loops we also determine the list of files reachable
-		 * and hang them on the tfile_check_list, so we can check that we
-		 * haven't created too many possible wakeup paths.
-		 *
-		 * We need to hold the epmutex across both ep_insert and ep_remove
-		 * b/c we want to make sure we are looking at a coherent view of
-		 * epoll network.
-		 */
-		mutex_lock(&epmutex);
-
-		if (is_file_epoll(target)) {
-			if (ep_loop_check(ep, target) != 0) {
-				clear_tfile_check_list();
-				goto out_unlock_epmutex;
-			}
-		} else
-			list_add(&target->f_tfile_llink, &tfile_check_list);
-
-
 		mutex_lock_nested(&ep->mtx, 0);
-
-		/*
-		 * Try to lookup the file inside our RB tree, Since we grabbed "mtx"
-		 * above, we can be sure to be able to use the item looked up by
-		 * ep_find() till we release the mutex.
-		 */
+	
+		/* Try to lookup the file inside our RB tree */
 		epi = ep_find(ep, target, epe.ep_fildes);
 
 		/*
-		 * If the file's event isn't triggered by anything, it needs to
-		 * be removed from the red-black tree. Otherwise, the file's
-		 * event needs to be modified if it altready exists or created
-		 * if not.
+	 	 * When we insert an epoll file descriptor, inside another epoll
+		 * file descriptor, there is the chance of creating closed loops,
+		 * which are better handled here, than in more critical paths.
+		 * While we are checking for loops we also determine the list of
+		 * files reachable and hang them on the tfile_check_list, so we
+		 * can check that we haven't created too many possible wakeup
+		 * paths.
+	 	 *
+		 * We do not need to take the global 'epumutex' to ep_insert()
+		 * when the epoll file descriptor is attaching directly to a
+		 * wakeup source, unless the epoll file descriptor is nested.
+		 * The purpose of taking the 'epmutex' on add is to prevent
+		 * complex toplogies such as loops and deep wakeup paths from
+		 * forming in parallel through multiple ep_insert() operations.
 		 */
-		if (!epe.ep_events && epi) {
-			if (ep_remove(ep, epi))
-				goto out_unlock_epmtx;
-		} else if (epe.ep_events && !epi) {
-			fullchk = !list_empty(&target->f_ep_links) ||
-				  is_file_epoll(target);
+
+		if (epe.ep_events && !epi) {
+			/* add this epoll entry */
+			if (!list_empty(&file->f_ep_links) ||
+							is_file_epoll(target)) {
+				full_check = true;
+				mutex_unlock(&ep->mtx);
+				mutex_lock(&epmutex);
+				if (is_file_epoll(target) &&
+						ep_loop_check(ep, target) != 0) {
+					clear_tfile_check_list();
+					goto out_fput;
+				} else if (!is_file_epoll(target)) {
+					list_add(&target->f_tfile_llink,
+							&tfile_check_list);
+				}
+				mutex_lock_nested(&ep->mtx, 0);
+				if (is_file_epoll(target)) {
+					tep = target->private_data;
+					mutex_lock_nested(&tep->mtx, 1);
+				}
+			}
 			epe.ep_events |= POLLERR | POLLHUP;
 			if (ep_insert(ep, epe.ep_ident, epe.ep_events, target,
-				      epe.ep_fildes, fullchk))
-				goto out_unlock_epmtx;
+				      epe.ep_fildes, full_check))
+				goto out_unlock;
+			if (full_check)
+				clear_tfile_check_list();
 		} else if (epe.ep_events && epi) {
+			/* modify this epoll entry */
 			epe.ep_events |= POLLERR | POLLHUP;
 			if (ep_modify(ep, epi, epe.ep_ident, epe.ep_events))
-				goto out_unlock_epmtx;
+				goto out_unlock;
+		} else if (!epe.ep_events && epi) {
+			/* delete this epoll entry */
+			if (is_file_epoll(target)) {
+				tep = target->private_data;
+				mutex_lock_nested(&tep->mtx, 1);
+			}
+			if (is_file_epoll(target))
+				mutex_lock_nested(&tep->mtx, 1);
+			if (ep_remove(ep, epi))
+				goto out_unlock;
 		}
 
+		if (tep)
+			mutex_unlock(&tep->mtx);
+		tep = NULL;
 		mutex_unlock(&ep->mtx);
-
-		mutex_unlock(&epmutex);
-
+		if (full_check)
+			mutex_unlock(&epmutex);
 		fput(target);
 	}
 	goto out;
 
-out_unlock_epmtx:
+out_unlock:
+	if (tep)
+		mutex_unlock(&tep->mtx);
 	mutex_unlock(&ep->mtx);
-out_unlock_epmutex:
-	mutex_unlock(&epmutex);
+	if (full_check)
+		mutex_unlock(&epmutex);
 out_fput:
 	fput(target);
 out:
@@ -2099,7 +2119,7 @@ out_free_ep:
  *
  * Returns: 0 on success or an errno code.
  */
-static int ep_eventpoll_ioctl(struct file *file, unsigned int cmd,
+static long ep_eventpoll_ioctl(struct file *file, unsigned int cmd,
 			      unsigned long arg)
 {
 	struct eventpoll *ep = file->private_data;
@@ -2116,7 +2136,7 @@ static int ep_eventpoll_ioctl(struct file *file, unsigned int cmd,
 /*
  * Construct a new eventpoll and return its file descriptor. 
  */
-SYSCALL_DEFINE(epoll)
+SYSCALL_DEFINE0(epoll)
 {
 	return ep_make_epoll(O_CLOEXEC);
 }
@@ -2140,144 +2160,34 @@ SYSCALL_DEFINE1(epoll_create, int, size)
 /*
  * The following function implements the controller interface for
  * the eventpoll file that enables the insertion/removal/change of
- * file descriptors inside the interest set. TODO: defer to write()
+ * file descriptors inside the interest set.
  */
 SYSCALL_DEFINE4(epoll_ctl, int, epfd, int, op, int, fd,
 		struct epoll_event __user *, event)
 {
-	int error;
-	int full_check = 0;
-	struct fd f, tf;
-	struct eventpoll *ep;
-	struct epitem *epi;
-	struct epoll_event epds;
-	struct eventpoll *tep = NULL;
+	struct epoll epe = { .ep_fildes = fd };;
+	struct file *file = fget(epfd);
+	int err;
 
-	error = -EFAULT;
+	err = -EBADF;
+	if (!file || !is_file_epoll(file))
+		goto out;
+
+	err = -EFAULT;
 	if (ep_op_has_event(op) &&
-	    copy_from_user(&epds, event, sizeof(struct epoll_event)))
-		goto error_return;
+			(get_user(epe.ep_events, (int *)&event->events) ||
+			 get_user(epe.ep_ident, (long long *)&event->data)))
+		goto out;
 
-	error = -EBADF;
-	f = fdget(epfd);
-	if (!f.file)
-		goto error_return;
-
-	/* Get the "struct file *" for the target file */
-	tf = fdget(fd);
-	if (!tf.file)
-		goto error_fput;
-
-	/* The target file descriptor must support poll */
-	error = -EPERM;
-	if (!tf.file->f_op->poll)
-		goto error_tgt_fput;
-
-	/* Check if EPOLLWAKEUP is allowed */
-	ep_take_care_of_epollwakeup(&epds);
-
-	/*
-	 * We have to check that the file structure underneath the file descriptor
-	 * the user passed to us _is_ an eventpoll file. And also we do not permit
-	 * adding an epoll file descriptor inside itself.
-	 */
-	error = -EINVAL;
-	if (f.file == tf.file || !is_file_epoll(f.file))
-		goto error_tgt_fput;
-
-	/*
-	 * At this point it is safe to assume that the "private_data" contains
-	 * our own data structure.
-	 */
-	ep = f.file->private_data;
-
-	/*
-	 * When we insert an epoll file descriptor, inside another epoll file
-	 * descriptor, there is the change of creating closed loops, which are
-	 * better handled here, than in more critical paths. While we are
-	 * checking for loops we also determine the list of files reachable
-	 * and hang them on the tfile_check_list, so we can check that we
-	 * haven't created too many possible wakeup paths.
-	 *
-	 * We do not need to take the global 'epumutex' on EPOLL_CTL_ADD when
-	 * the epoll file descriptor is attaching directly to a wakeup source,
-	 * unless the epoll file descriptor is nested. The purpose of taking the
-	 * 'epmutex' on add is to prevent complex toplogies such as loops and
-	 * deep wakeup paths from forming in parallel through multiple
-	 * EPOLL_CTL_ADD operations.
-	 */
-	mutex_lock_nested(&ep->mtx, 0);
-	if (op == EPOLL_CTL_ADD) {
-		if (!list_empty(&f.file->f_ep_links) ||
-						is_file_epoll(tf.file)) {
-			full_check = 1;
-			mutex_unlock(&ep->mtx);
-			mutex_lock(&epmutex);
-			if (is_file_epoll(tf.file)) {
-				error = -ELOOP;
-				if (ep_loop_check(ep, tf.file) != 0) {
-					clear_tfile_check_list();
-					goto error_tgt_fput;
-				}
-			} else
-				list_add(&tf.file->f_tfile_llink,
-							&tfile_check_list);
-			mutex_lock_nested(&ep->mtx, 0);
-			if (is_file_epoll(tf.file)) {
-				tep = tf.file->private_data;
-				mutex_lock_nested(&tep->mtx, 1);
-			}
-		}
-	}
-
-	/*
-	 * Try to lookup the file inside our RB tree, Since we grabbed "mtx"
-	 * above, we can be sure to be able to use the item looked up by
-	 * ep_find() till we release the mutex.
-	 */
-	epi = ep_find(ep, tf.file, fd);
-
-	error = -EINVAL;
-	switch (op) {
-	case EPOLL_CTL_ADD:
-		if (!epi) {
-			epds.events |= POLLERR | POLLHUP;
-			error = ep_insert(ep, (long long)epds.data,
-					  epds.events, tf.file, fd, full_check);
-		} else
-			error = -EEXIST;
-		if (full_check)
-			clear_tfile_check_list();
-		break;
-	case EPOLL_CTL_DEL:
-		if (epi)
-			error = ep_remove(ep, epi);
-		else
-			error = -ENOENT;
-		break;
-	case EPOLL_CTL_MOD:
-		if (epi) {
-			epds.events |= POLLERR | POLLHUP;
-			error = ep_modify(ep, epi, (long long)epds.data,
-					  epds.events);
-		} else
-			error = -ENOENT;
-		break;
-	}
-	if (tep != NULL)
-		mutex_unlock(&tep->mtx);
-	mutex_unlock(&ep->mtx);
-
-error_tgt_fput:
-	if (full_check)
-		mutex_unlock(&epmutex);
-
-	fdput(tf);
-error_fput:
-	fdput(f);
-error_return:
-
-	return error;
+	 err = ep_eventpoll_write(file, (const char *)&epe,
+			 	  sizeof(struct epoll), NULL);
+	 if (err == sizeof(struct epoll))
+		 err = 0;
+	 else if (!err)
+		 err = -EBADF;
+out:
+	 fput(file);
+	 return err;
 }
 
 /*
