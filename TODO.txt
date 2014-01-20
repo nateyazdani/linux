@@ -1,0 +1,3 @@
+[ ] use pointer-less ioctl()s to control timeout
+[ ] redirect epoll_[p ]wait() to ep_eventpoll_read()
+[ ] streamline code
