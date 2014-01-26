@@ -2115,7 +2115,7 @@ out_free_ep:
  * ep_eventpoll_ioctl - configure an eventpoll's behavior.
  *
  * @cmd: An EPIOC_* control command.
- * @arg: A pointer whose type depends on @cmd.
+ * @arg: A pointer whose type depends on @cmd (usually int).
  *
  * Returns: 0 on success or an errno code.
  */
@@ -2181,13 +2181,11 @@ SYSCALL_DEFINE4(epoll_ctl, int, epfd, int, op, int, fd,
 
 	 err = ep_eventpoll_write(file, (const char *)&epe,
 			 	  sizeof(struct epoll), NULL);
-	 if (err == sizeof(struct epoll))
-		 err = 0;
-	 else if (!err)
+	 if (!err)
 		 err = -EBADF;
 out:
 	 fput(file);
-	 return err;
+	 return err < 0 ? err : 0;
 }
 
 /*

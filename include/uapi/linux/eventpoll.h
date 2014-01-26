@@ -58,8 +58,8 @@
 #endif
 
 /* ioctl() requests */
-#define EPIOC_GETTIMEOUT	_IOR(0, 0, int)
-#define EPIOC_SETTIMEOUT	_IOW(0, 1, int)
+#define EPIOC_GETTIMEOUT	_IOR('$', 0x10, int)
+#define EPIOC_SETTIMEOUT	_IOW('$', 0x11, int)
 
 struct epoll_event {
 	__u32 events;
