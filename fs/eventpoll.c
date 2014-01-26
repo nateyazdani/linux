@@ -912,7 +912,7 @@ static ssize_t ep_eventpoll_read(struct file *file, char __user *buf,
 				 size_t bufsz, loff_t *pos);
 
 static long ep_eventpoll_ioctl(struct file *file, unsigned int cmd,
-			      unsigned long arg);
+			       unsigned long arg);
 
 /* File callbacks that implement the eventpoll file behaviour */
 static const struct file_operations eventpoll_fops = {
@@ -2066,7 +2066,7 @@ ssize_t ep_eventpoll_read(struct file *file, char __user *buf, size_t bufsz,
  *
  * Returns: Returns the file descriptor of the new epoll or negative error code.
  */
-static int ep_make_epoll(int flags)
+static int ep_make_epoll(int flags, int timeout)
 {
 	int error, fd;
 	struct eventpoll *ep = NULL;
@@ -2101,7 +2101,7 @@ static int ep_make_epoll(int flags)
 	}
 	ep->file = file;
 	fd_install(fd, file);
-	ep->timeout = -1;
+	ep->timeout = timeout;
 	return fd;
 
 out_free_fd:
@@ -2136,9 +2136,9 @@ static long ep_eventpoll_ioctl(struct file *file, unsigned int cmd,
 /*
  * Construct a new eventpoll and return its file descriptor. 
  */
-SYSCALL_DEFINE0(epoll)
+SYSCALL_DEFINE2(epoll, int, flags, int timeout)
 {
-	return ep_make_epoll(O_CLOEXEC);
+	return ep_make_epoll(flags, timeout);
 }
 
 /*
@@ -2146,7 +2146,7 @@ SYSCALL_DEFINE0(epoll)
  */
 SYSCALL_DEFINE1(epoll_create1, int, flags)
 {
-	return ep_make_epoll(flags);
+	return ep_make_epoll(flags, -1);
 }
 
 SYSCALL_DEFINE1(epoll_create, int, size)
@@ -2154,7 +2154,7 @@ SYSCALL_DEFINE1(epoll_create, int, size)
 	if (size <= 0)
 		return -EINVAL;
 
-	return ep_make_epoll(0);
+	return ep_make_epoll(0, -1);
 }
 
 /*
@@ -2165,7 +2165,7 @@ SYSCALL_DEFINE1(epoll_create, int, size)
 SYSCALL_DEFINE4(epoll_ctl, int, epfd, int, op, int, fd,
 		struct epoll_event __user *, event)
 {
-	struct epoll epe = { .ep_fildes = fd };;
+	struct epoll epe = { .ep_fildes = fd };
 	struct file *file = fget(epfd);
 	int err;
 
