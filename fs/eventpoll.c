@@ -2136,7 +2136,7 @@ static long ep_eventpoll_ioctl(struct file *file, unsigned int cmd,
 /*
  * Construct a new eventpoll and return its file descriptor. 
  */
-SYSCALL_DEFINE2(epoll, int, flags, int timeout)
+SYSCALL_DEFINE2(epoll, int, flags, int, timeout)
 {
 	return ep_make_epoll(flags, timeout);
 }
