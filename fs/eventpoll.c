@@ -1582,7 +1582,7 @@ static int ep_send_events(struct eventpoll *ep, void __user *buf, size_t bufsz)
 	return ep_scan_ready_list(ep, ep_send_events_proc, &esed, 0, false);
 }
 
-/* 
+/*
  * Mostly biolerplate code from ep_send_events_proc(), but much cleaner to put
  * in a separate function.
  */
@@ -1700,7 +1700,7 @@ static inline struct timespec ep_set_mstimeout(long ms)
  */
 static int ep_poll(struct eventpoll *ep, void __user *buffer, size_t length,
 		   long timeout, int (*sender)(struct eventpoll *,
-		   			       void __user *, size_t))
+					       void __user *, size_t))
 {
 	int res = 0, eavail, timed_out = 0;
 	unsigned long flags;
@@ -1935,19 +1935,19 @@ static ssize_t ep_eventpoll_write(struct file *file, const char __user *buf,
 			goto out_fput;
 
 		mutex_lock_nested(&ep->mtx, 0);
-	
+
 		/* Try to lookup the file inside our RB tree */
 		epi = ep_find(ep, target, epe.ep_fildes);
 
 		/*
-	 	 * When we insert an epoll file descriptor, inside another epoll
+		 * When we insert an epoll file descriptor, inside another epoll
 		 * file descriptor, there is the chance of creating closed loops,
 		 * which are better handled here, than in more critical paths.
 		 * While we are checking for loops we also determine the list of
 		 * files reachable and hang them on the tfile_check_list, so we
 		 * can check that we haven't created too many possible wakeup
 		 * paths.
-	 	 *
+		 *
 		 * We do not need to take the global 'epumutex' to ep_insert()
 		 * when the epoll file descriptor is attaching directly to a
 		 * wakeup source, unless the epoll file descriptor is nested.
@@ -2058,15 +2058,32 @@ ssize_t ep_eventpoll_read(struct file *file, char __user *buf, size_t bufsz,
 				ep_send_epes) * sizeof(struct epoll);
 }
 
-/**
- * ep_make_epoll - Make a new epoll file in the current process's file table with
- *		   an infinite timeout by default.
+/*
+ * ep_eventpoll_ioctl - configure an eventpoll's behavior.
  *
- * @flags: Optional creation flags.
+ * @cmd: An EPIOC_* control command.
+ * @arg: A pointer whose type depends on @cmd (usually int).
  *
- * Returns: Returns the file descriptor of the new epoll or negative error code.
+ * Returns: 0 on success or an errno code.
  */
-static int ep_make_epoll(int flags, int timeout)
+static long ep_eventpoll_ioctl(struct file *file, unsigned int cmd,
+			      unsigned long arg)
+{
+	struct eventpoll *ep = file->private_data;
+	switch (cmd) {
+	case EPIOC_GETTIMEOUT:
+		return put_user(ep->timeout, (int __user *)arg);
+	case EPIOC_SETTIMEOUT:
+		return get_user(ep->timeout, (int __user *)arg);
+	default:
+		return -EINVAL;
+	}
+}
+
+/*
+ * Open an eventpoll file descriptor.
+ */
+SYSCALL_DEFINE1(epoll_create1, int, flags)
 {
 	int error, fd;
 	struct eventpoll *ep = NULL;
@@ -2101,7 +2118,7 @@ static int ep_make_epoll(int flags, int timeout)
 	}
 	ep->file = file;
 	fd_install(fd, file);
-	ep->timeout = timeout;
+	ep->timeout = -1; /* infinite (i.e., no) timeout by default */
 	return fd;
 
 out_free_fd:
@@ -2111,50 +2128,12 @@ out_free_ep:
 	return error;
 }
 
-/*
- * ep_eventpoll_ioctl - configure an eventpoll's behavior.
- *
- * @cmd: An EPIOC_* control command.
- * @arg: A pointer whose type depends on @cmd (usually int).
- *
- * Returns: 0 on success or an errno code.
- */
-static long ep_eventpoll_ioctl(struct file *file, unsigned int cmd,
-			      unsigned long arg)
-{
-	struct eventpoll *ep = file->private_data;
-	switch (cmd) {
-	case EPIOC_GETTIMEOUT:
-		return put_user(ep->timeout, (int __user *)arg);
-	case EPIOC_SETTIMEOUT:
-		return get_user(ep->timeout, (int __user *)arg);
-	default:
-		return -EINVAL;
-	}
-}
-
-/*
- * Construct a new eventpoll and return its file descriptor. 
- */
-SYSCALL_DEFINE2(epoll, int, flags, int, timeout)
-{
-	return ep_make_epoll(flags, timeout);
-}
-
-/*
- * Open an eventpoll file descriptor.
- */
-SYSCALL_DEFINE1(epoll_create1, int, flags)
-{
-	return ep_make_epoll(flags, -1);
-}
-
 SYSCALL_DEFINE1(epoll_create, int, size)
 {
 	if (size <= 0)
 		return -EINVAL;
 
-	return ep_make_epoll(0, -1);
+	return sys_epoll_create1(0);
 }
 
 /*
@@ -2179,13 +2158,13 @@ SYSCALL_DEFINE4(epoll_ctl, int, epfd, int, op, int, fd,
 			 get_user(epe.ep_ident, (long long *)&event->data)))
 		goto out;
 
-	 err = ep_eventpoll_write(file, (const char *)&epe,
-			 	  sizeof(struct epoll), NULL);
-	 if (!err)
-		 err = -EBADF;
+	err = ep_eventpoll_write(file, (const char *)&epe,
+				 sizeof(struct epoll), NULL);
+	if (!err)
+		err = -EBADF;
 out:
-	 fput(file);
-	 return err < 0 ? err : 0;
+	fput(file);
+	return err < 0 ? err : 0;
 }
 
 /*
