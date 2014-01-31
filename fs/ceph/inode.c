@@ -9,6 +9,7 @@
 #include <linux/namei.h>
 #include <linux/writeback.h>
 #include <linux/vmalloc.h>
+#include <linux/posix_acl.h>
 
 #include "super.h"
 #include "mds_client.h"
@@ -96,6 +97,7 @@ const struct inode_operations ceph_file_iops = {
 	.listxattr = ceph_listxattr,
 	.removexattr = ceph_removexattr,
 	.get_acl = ceph_get_acl,
+	.set_acl = ceph_set_acl,
 };
 
 
@@ -1615,6 +1617,7 @@ static const struct inode_operations ceph_symlink_iops = {
 	.listxattr = ceph_listxattr,
 	.removexattr = ceph_removexattr,
 	.get_acl = ceph_get_acl,
+	.set_acl = ceph_set_acl,
 };
 
 /*
@@ -1805,7 +1808,7 @@ int ceph_setattr(struct dentry *dentry, struct iattr *attr)
 		__mark_inode_dirty(inode, inode_dirty_flags);
 
 	if (ia_valid & ATTR_MODE) {
-		err = ceph_acl_chmod(dentry, inode);
+		err = posix_acl_chmod(inode, attr->ia_mode);
 		if (err)
 			goto out_put;
 	}

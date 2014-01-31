@@ -736,20 +736,19 @@ extern void __init ceph_xattr_init(void);
 extern void ceph_xattr_exit(void);
 
 /* acl.c */
-extern const struct xattr_handler ceph_xattr_acl_access_handler;
-extern const struct xattr_handler ceph_xattr_acl_default_handler;
 extern const struct xattr_handler *ceph_xattr_handlers[];
 
 #ifdef CONFIG_CEPH_FS_POSIX_ACL
 
 struct posix_acl *ceph_get_acl(struct inode *, int);
+int ceph_set_acl(struct inode *inode, struct posix_acl *acl, int type);
 int ceph_init_acl(struct dentry *, struct inode *, struct inode *);
-int ceph_acl_chmod(struct dentry *, struct inode *);
 void ceph_forget_all_cached_acls(struct inode *inode);
 
 #else
 
 #define ceph_get_acl NULL
+#define ceph_set_acl NULL
 
 static inline int ceph_init_acl(struct dentry *dentry, struct inode *inode,
 				struct inode *dir)

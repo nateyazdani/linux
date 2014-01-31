@@ -66,13 +66,6 @@ struct posix_acl *ceph_get_acl(struct inode *inode, int type)
 	char *value = NULL;
 	struct posix_acl *acl;
 
-	if (!IS_POSIXACL(inode))
-		return NULL;
-
-	acl = ceph_get_cached_acl(inode, type);
-	if (acl != ACL_NOT_CACHED)
-		return acl;
-
 	switch (type) {
 	case ACL_TYPE_ACCESS:
 		name = POSIX_ACL_XATTR_ACCESS;
@@ -107,14 +100,14 @@ struct posix_acl *ceph_get_acl(struct inode *inode, int type)
 	return acl;
 }
 
-static int ceph_set_acl(struct dentry *dentry, struct inode *inode,
-				struct posix_acl *acl, int type)
+int ceph_set_acl(struct inode *inode, struct posix_acl *acl, int type)
 {
 	int ret = 0, size = 0;
 	const char *name = NULL;
 	char *value = NULL;
 	struct iattr newattrs;
 	umode_t new_mode = inode->i_mode, old_mode = inode->i_mode;
+	struct dentry *dentry;
 
 	if (acl) {
 		ret = posix_acl_valid(acl);
@@ -158,12 +151,13 @@ static int ceph_set_acl(struct dentry *dentry, struct inode *inode,
 			goto out_free;
 	}
 
+	dentry = d_find_alias(inode);
 	if (new_mode != old_mode) {
 		newattrs.ia_mode = new_mode;
 		newattrs.ia_valid = ATTR_MODE;
 		ret = ceph_setattr(dentry, &newattrs);
 		if (ret)
-			goto out_free;
+			goto out_dput;
 	}
 
 	if (value)
@@ -177,11 +171,13 @@ static int ceph_set_acl(struct dentry *dentry, struct inode *inode,
 			newattrs.ia_valid = ATTR_MODE;
 			ceph_setattr(dentry, &newattrs);
 		}
-		goto out_free;
+		goto out_dput;
 	}
 
 	ceph_set_cached_acl(inode, type, acl);
 
+out_dput:
+	dput(dentry);
 out_free:
 	kfree(value);
 out:
@@ -190,143 +186,24 @@ out:
 
 int ceph_init_acl(struct dentry *dentry, struct inode *inode, struct inode *dir)
 {
-	struct posix_acl *acl = NULL;
-	int ret = 0;
+	struct posix_acl *default_acl, *acl;
+	int error;
 
-	if (!S_ISLNK(inode->i_mode)) {
-		if (IS_POSIXACL(dir)) {
-			acl = ceph_get_acl(dir, ACL_TYPE_DEFAULT);
-			if (IS_ERR(acl)) {
-				ret = PTR_ERR(acl);
-				goto out;
-			}
-		}
+	error = posix_acl_create(dir, &inode->i_mode, &default_acl, &acl);
+	if (error)
+		return error;
 
-		if (!acl)
-			inode->i_mode &= ~current_umask();
-	}
-
-	if (IS_POSIXACL(dir) && acl) {
-		if (S_ISDIR(inode->i_mode)) {
-			ret = ceph_set_acl(dentry, inode, acl,
-						ACL_TYPE_DEFAULT);
-			if (ret)
-				goto out_release;
-		}
-		ret = posix_acl_create(&acl, GFP_NOFS, &inode->i_mode);
-		if (ret < 0)
-			goto out;
-		else if (ret > 0)
-			ret = ceph_set_acl(dentry, inode, acl, ACL_TYPE_ACCESS);
-		else
-			cache_no_acl(inode);
-	} else {
+	if (!default_acl && !acl)
 		cache_no_acl(inode);
-	}
 
-out_release:
-	posix_acl_release(acl);
-out:
-	return ret;
+	if (default_acl) {
+		error = ceph_set_acl(inode, default_acl, ACL_TYPE_DEFAULT);
+		posix_acl_release(default_acl);
+	}
+	if (acl) {
+		if (!error)
+			error = ceph_set_acl(inode, acl, ACL_TYPE_ACCESS);
+		posix_acl_release(acl);
+	}
+	return error;
 }
-
-int ceph_acl_chmod(struct dentry *dentry, struct inode *inode)
-{
-	struct posix_acl *acl;
-	int ret = 0;
-
-	if (S_ISLNK(inode->i_mode)) {
-		ret = -EOPNOTSUPP;
-		goto out;
-	}
-
-	if (!IS_POSIXACL(inode))
-		goto out;
-
-	acl = ceph_get_acl(inode, ACL_TYPE_ACCESS);
-	if (IS_ERR_OR_NULL(acl)) {
-		ret = PTR_ERR(acl);
-		goto out;
-	}
-
-	ret = posix_acl_chmod(&acl, GFP_KERNEL, inode->i_mode);
-	if (ret)
-		goto out;
-	ret = ceph_set_acl(dentry, inode, acl, ACL_TYPE_ACCESS);
-	posix_acl_release(acl);
-out:
-	return ret;
-}
-
-static int ceph_xattr_acl_get(struct dentry *dentry, const char *name,
-				void *value, size_t size, int type)
-{
-	struct posix_acl *acl;
-	int ret = 0;
-
-	if (!IS_POSIXACL(dentry->d_inode))
-		return -EOPNOTSUPP;
-
-	acl = ceph_get_acl(dentry->d_inode, type);
-	if (IS_ERR(acl))
-		return PTR_ERR(acl);
-	if (acl == NULL)
-		return -ENODATA;
-
-	ret = posix_acl_to_xattr(&init_user_ns, acl, value, size);
-	posix_acl_release(acl);
-
-	return ret;
-}
-
-static int ceph_xattr_acl_set(struct dentry *dentry, const char *name,
-			const void *value, size_t size, int flags, int type)
-{
-	int ret = 0;
-	struct posix_acl *acl = NULL;
-
-	if (!inode_owner_or_capable(dentry->d_inode)) {
-		ret = -EPERM;
-		goto out;
-	}
-
-	if (!IS_POSIXACL(dentry->d_inode)) {
-		ret = -EOPNOTSUPP;
-		goto out;
-	}
-
-	if (value) {
-		acl = posix_acl_from_xattr(&init_user_ns, value, size);
-		if (IS_ERR(acl)) {
-			ret = PTR_ERR(acl);
-			goto out;
-		}
-
-		if (acl) {
-			ret = posix_acl_valid(acl);
-			if (ret)
-				goto out_release;
-		}
-	}
-
-	ret = ceph_set_acl(dentry, dentry->d_inode, acl, type);
-
-out_release:
-	posix_acl_release(acl);
-out:
-	return ret;
-}
-
-const struct xattr_handler ceph_xattr_acl_default_handler = {
-	.prefix = POSIX_ACL_XATTR_DEFAULT,
-	.flags  = ACL_TYPE_DEFAULT,
-	.get    = ceph_xattr_acl_get,
-	.set    = ceph_xattr_acl_set,
-};
-
-const struct xattr_handler ceph_xattr_acl_access_handler = {
-	.prefix = POSIX_ACL_XATTR_ACCESS,
-	.flags  = ACL_TYPE_ACCESS,
-	.get    = ceph_xattr_acl_get,
-	.set    = ceph_xattr_acl_set,
-};
