@@ -17,7 +17,6 @@
 /* For O_CLOEXEC */
 #include <linux/fcntl.h>
 #include <linux/types.h>
-#include <linux/poll.h>
 
 /* Flags for epoll_create1.  */
 #define EPOLL_CLOEXEC O_CLOEXEC
