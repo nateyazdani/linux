@@ -2043,6 +2043,7 @@ ssize_t ep_eventpoll_read(struct file *file, char __user *buf, size_t bufsz,
 			  loff_t *pos)
 {
 	struct eventpoll *ep = file->private_data;
+	int tmp;
 
 	/* The event buffer must be of a reasonable size */
 	if (bufsz / sizeof(struct epoll) == 0 ||
@@ -2054,8 +2055,9 @@ ssize_t ep_eventpoll_read(struct file *file, char __user *buf, size_t bufsz,
 		return -EFAULT;
 
 	/* Time to fish for events ... */
-	return (ssize_t)ep_poll(file->private_data, buf, bufsz, ep->timeout,
-				ep_send_epes) * sizeof(struct epoll);
+	tmp = ep_poll(file->private_data, buf, bufsz, ep->timeout,
+		      ep_send_epes);
+	return tmp < 0 ? tmp : (ssize_t)tmp * sizeof(struct epoll);
 }
 
 /*
