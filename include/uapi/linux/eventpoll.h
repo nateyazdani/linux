@@ -19,6 +19,8 @@
 #include <linux/types.h>
 
 /* Flags for epoll_create1.  */
+#define EPOLL_MONOTIME (1 << 1)
+#define EPOLL_REALTIME (1 << 2)
 #define EPOLL_CLOEXEC O_CLOEXEC
 
 /* Valid opcodes to issue to sys_epoll_ctl() */
@@ -55,10 +57,6 @@
 #else
 #define EPOLL_PACKED
 #endif
-
-/* ioctl() requests */
-#define EPIOC_GETTIMEOUT	_IOR('$', 0x10, int)
-#define EPIOC_SETTIMEOUT	_IOW('$', 0x11, int)
 
 struct epoll_event {
 	__u32 events;

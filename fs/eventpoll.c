@@ -219,9 +219,6 @@ struct eventpoll {
 
 	struct file *file;
 
-	/* Default timeout */
-	int timeout;
-
 	/* used to optimize loop detection check */
 	int visited;
 	struct list_head visited_list_link;
@@ -252,16 +249,13 @@ struct ep_pqueue {
 };
 
 /* Used by the ep_send_events() function as callback private data */
-struct ep_send_events_data {
-	int maxevents;
-	struct epoll_event __user *events;
-};
-
-/* ep_scan_ready_list() callback data for ep_send_epes() */
-struct ep_send_epes_data
-{
-	int max;
-	struct epoll __user *epes;
+struct ep_send_data {
+	union {
+		struct epoll_event __user *uevent;
+		struct epoll __user *uentry;
+	};
+	unsigned int max;
+	enum { EPOLL_EVENT, EPOLL_ENTRY } api;
 };
 
 /*
@@ -905,15 +899,6 @@ static int ep_show_fdinfo(struct seq_file *m, struct file *f)
 }
 #endif
 
-static ssize_t ep_eventpoll_write(struct file *file, const char __user *buf,
-				  size_t bufsz, loff_t *pos);
-
-static ssize_t ep_eventpoll_read(struct file *file, char __user *buf,
-				 size_t bufsz, loff_t *pos);
-
-static long ep_eventpoll_ioctl(struct file *file, unsigned int cmd,
-			       unsigned long arg);
-
 /* File callbacks that implement the eventpoll file behaviour */
 static const struct file_operations eventpoll_fops = {
 #ifdef CONFIG_PROC_FS
@@ -921,9 +906,6 @@ static const struct file_operations eventpoll_fops = {
 #endif
 	.release	= ep_eventpoll_release,
 	.poll		= ep_eventpoll_poll,
-	.read		= ep_eventpoll_read,
-	.write		= ep_eventpoll_write,
-	.unlocked_ioctl	= ep_eventpoll_ioctl,
 	.llseek		= noop_llseek,
 };
 
@@ -1418,7 +1400,8 @@ error_create_wakeup_source:
  * Modify the interest event mask by dropping an event if the new mask
  * has a match in the current file status. Must be called with "mtx" held.
  */
-static int ep_modify(struct eventpoll *ep, struct epitem *epi, long long ident, int events)
+static int ep_modify(struct eventpoll *ep, struct epitem *epi, long long ident,
+		     int events)
 {
 	int pwake = 0;
 	unsigned int revents;
@@ -1492,14 +1475,12 @@ static int ep_modify(struct eventpoll *ep, struct epitem *epi, long long ident, 
 	return 0;
 }
 
-static int ep_send_events_proc(struct eventpoll *ep, struct list_head *head,
-			       void *priv)
+static int ep_send_proc(struct eventpoll *ep, struct list_head *head, void *priv)
 {
-	struct ep_send_events_data *esed = priv;
-	int eventcnt;
+	struct ep_send_data *esd = priv;
+	int i;
 	unsigned int revents;
 	struct epitem *epi;
-	struct epoll_event __user *uevent;
 	struct wakeup_source *ws;
 	poll_table pt;
 
@@ -1510,8 +1491,7 @@ static int ep_send_events_proc(struct eventpoll *ep, struct list_head *head,
 	 * Items cannot vanish during the loop because ep_scan_ready_list() is
 	 * holding "mtx" during this call.
 	 */
-	for (eventcnt = 0, uevent = esed->events;
-	     !list_empty(head) && eventcnt < esed->maxevents;) {
+	for (i = 0; !list_empty(head) && i < esd->max; ++i) {
 		epi = list_first_entry(head, struct epitem, rdllink);
 
 		/*
@@ -1534,96 +1514,8 @@ static int ep_send_events_proc(struct eventpoll *ep, struct list_head *head,
 
 		revents = ep_item_poll(epi, &pt);
 
-		/*
-		 * If the event mask intersect the caller-requested one,
-		 * deliver the event to userspace. Again, ep_scan_ready_list()
-		 * is holding "mtx", so no operations coming from userspace
-		 * can change the item.
-		 */
-		if (revents) {
-			if (__put_user(revents, &uevent->events) ||
-			    __put_user(epi->ident, &uevent->data)) {
-				list_add(&epi->rdllink, head);
-				ep_pm_stay_awake(epi);
-				return eventcnt ? eventcnt : -EFAULT;
-			}
-			eventcnt++;
-			uevent++;
-			if (epi->events & EPOLLONESHOT)
-				epi->events &= EP_PRIVATE_BITS;
-			else if (!(epi->events & EPOLLET)) {
-				/*
-				 * If this file has been added with Level
-				 * Trigger mode, we need to insert back inside
-				 * the ready list, so that the next call to
-				 * epoll_wait() will check again the events
-				 * availability. At this point, no one can insert
-				 * into ep->rdllist besides us. The epoll_ctl()
-				 * callers are locked out by
-				 * ep_scan_ready_list() holding "mtx" and the
-				 * poll callback will queue them in ep->ovflist.
-				 */
-				list_add_tail(&epi->rdllink, &ep->rdllist);
-				ep_pm_stay_awake(epi);
-			}
-		}
-	}
-
-	return eventcnt;
-}
-
-static int ep_send_events(struct eventpoll *ep, void __user *buf, size_t bufsz)
-{
-	struct ep_send_events_data esed;
-
-	esed.maxevents = bufsz / sizeof(struct epoll_event);
-	esed.events = buf;
-
-	return ep_scan_ready_list(ep, ep_send_events_proc, &esed, 0, false);
-}
-
-/*
- * Mostly biolerplate code from ep_send_events_proc(), but much cleaner to put
- * in a separate function.
- */
-static int ep_send_epes_proc(struct eventpoll *ep, struct list_head *head,
-			     void *priv)
-{
-	struct ep_send_epes_data *esed = priv;
-	unsigned int revents, i;
-	struct epitem *epi;
-	struct wakeup_source *ws;
-	poll_table pt;
-
-	init_poll_funcptr(&pt, NULL);
-
-	/*
-	 * We can loop without lock because we are passed a task private list.
-	 * Items cannot vanish during the loop because ep_scan_ready_list() is
-	 * holding "mtx" during this call.
-	 */
-	for (i = 0; !list_empty(head) && i < esed->max; ++i) {
-		epi = list_first_entry(head, struct epitem, rdllink);
-
-		/*
-		 * Activate ep->ws before deactivating epi->ws to prevent
-		 * triggering auto-suspend here (in case we reactive epi->ws
-		 * below).
-		 *
-		 * This could be rearranged to delay the deactivation of epi->ws
-		 * instead, but then epi->ws would temporarily be out of sync
-		 * with ep_is_linked().
-		 */
-		ws = ep_wakeup_source(epi);
-		if (ws) {
-			if (ws->active)
-				__pm_stay_awake(ep->ws);
-			__pm_relax(ws);
-		}
-
-		list_del_init(&epi->rdllink);
-
-		revents = ep_item_poll(epi, &pt);
+		if (!revents)
+			continue;
 
 		/*
 		 * If the event mask intersect the caller-requested one,
@@ -1631,42 +1523,63 @@ static int ep_send_epes_proc(struct eventpoll *ep, struct list_head *head,
 		 * is holding "mtx", so no operations coming from userspace
 		 * can change the item.
 		 */
-		if (revents) {
-			if (__put_user(revents, &esed->epes[i].ep_events) ||
-			    __put_user(epi->ident, &esed->epes[i].ep_ident) ||
-			    __put_user(epi->ffd.fd, &esed->epes[i].ep_fildes)) {
-				list_add(&epi->rdllink, head);
-				ep_pm_stay_awake(epi);
-				return i ? i : -EFAULT;
-			}
-			if (epi->events & EPOLLONESHOT)
-				epi->events &= EP_PRIVATE_BITS;
-			else if (!(epi->events & EPOLLET)) {
-				/*
-				 * If this file has been added with Level
-				 * Trigger mode, we need to insert back inside
-				 * the ready list, so that the next call to
-				 * epoll_wait() will check again the events
-				 * availability. At this point, no one can insert
-				 * into ep->rdllist besides us. The epoll_ctl()
-				 * callers are locked out by
-				 * ep_scan_ready_list() holding "mtx" and the
-				 * poll callback will queue them in ep->ovflist.
-				 */
-				list_add_tail(&epi->rdllink, &ep->rdllist);
-				ep_pm_stay_awake(epi);
-			}
+		if (esd->api == EPOLL_ENTRY &&
+			(__put_user(epi->ffd.fd, &esd->uentry[i].ep_fildes) ||
+			 __put_user(revents, &esd->uentry[i].ep_events) ||
+			 __put_user(epi->ident, &esd->uentry[i].ep_ident))) {
+
+			list_add(&epi->rdllink, head);
+			ep_pm_stay_awake(epi);
+			return i ? i : -EFAULT;
+		} else if (esd->api == EPOLL_EVENT &&
+			(__put_user(revents, &esd->uevent[i].events) ||
+			 __put_user(epi->ident, &esd->uevent[i].data))) {
+
+			list_add(&epi->rdllink, head);
+			ep_pm_stay_awake(epi);
+			return i ? i : -EFAULT;
+		} else {
+			return -EINVAL;
+		}
+
+		if (epi->events & EPOLLONESHOT)
+			epi->events &= EP_PRIVATE_BITS;
+		else if (!(epi->events & EPOLLET)) {
+			/*
+			 * If this file has been added with Level
+			 * Trigger mode, we need to insert back inside
+			 * the ready list, so that the next call to
+			 * epoll_wait() will check again the events
+			 * availability. At this point, no one can insert
+			 * into ep->rdllist besides us. The epoll_ctl()
+			 * callers are locked out by
+			 * ep_scan_ready_list() holding "mtx" and the
+			 * poll callback will queue them in ep->ovflist.
+			 */
+			list_add_tail(&epi->rdllink, &ep->rdllist);
+			ep_pm_stay_awake(epi);
 		}
 	}
 
 	return i;
 }
 
-static int ep_send_epes(struct eventpoll *ep, void __user *buf, size_t bufsz)
+static int ep_send_events(struct eventpoll *ep, void __user *buf, size_t len)
 {
-	struct ep_send_epes_data esed = { .max = bufsz / sizeof(struct epoll),
-					  .epes = buf };
-	return ep_scan_ready_list(ep, ep_send_epes_proc, &esed, 0, false);
+	struct ep_send_data esd = { .uevent = buf,
+				    .max = len / sizeof(struct epoll_event),
+				    .api = EPOLL_ENTRY };
+
+	return ep_scan_ready_list(ep, ep_send_proc, &esd, 0, false);
+}
+
+static int ep_send_entries(struct eventpoll *ep, void __user *buf, size_t len)
+{
+	struct ep_send_data esd = { .uentry = buf,
+				    .max = len / sizeof(struct epoll),
+				    .api = EPOLL_ENTRY };
+
+	return ep_scan_ready_list(ep, ep_send_proc, &esd, 0, false);
 }
 
 static inline struct timespec ep_set_mstimeout(long ms)
@@ -1685,14 +1598,15 @@ static inline struct timespec ep_set_mstimeout(long ms)
  *           event buffer.
  *
  * @ep: Pointer to the eventpoll context.
- * @events: Pointer to the userspace buffer where the ready events should be
+ * @buffer: Pointer to the userspace buffer where the ready events should be
  *          stored.
- * @maxevents: Size (in terms of number of events) of the caller event buffer.
+ * @length: Size of the caller event buffer.
  * @timeout: Maximum timeout for the ready events fetch operation, in
  *           milliseconds. If the @timeout is zero, the function will not block,
  *           while if the @timeout is less than zero, the function will block
  *           until at least one event has been retrieved (or an error
- *           occurred).
+ *           occurred). Flags set on the eventpoll itself, e.g., EPOLL_MONOTIME
+ *	     and EPOLL_REALTIME, may affect the exact behavior of timeouts.
  * @sender: Function to call to send ready events to userspace.
  *
  * Returns: Returns the number of ready events which have been fetched, or an
@@ -1877,209 +1791,118 @@ static void clear_tfile_check_list(void)
 
 /**
  *
- * ep_eventpoll_write - Create, remove, or modify events to poll for. The epoll
- *			file distinguishes between events by file descriptor,
- *			but it will also store a user-defined identifier along
- *			with it. To modify an existing event, simply set
- *			->ep_fildes to the target file desciptor and set
- *			->ep_ident and ->ep_events to whatever values you wish
- *			to change them to. To remove an event, set ->ep_fildes
- *			to the relevant file descriptor and clear ->ep_events.
+ * ep_control - Create, remove, or modify events to poll for. The eventpoll
+ *	        distinguishes between eventpoll entries by file descriptor,
+ *	        but it will also store a user-defined identifier along
+ *	        with it. To modify an existing event, simply set
+ *	        ->ep_fildes to the target file desciptor and set
+ *	        ->ep_ident and ->ep_events to whatever values you wish
+ *	        to change them to. To remove an event, set ->ep_fildes
+ *	        to the relevant file descriptor and clear ->ep_events.
  *
- * @file: The epoll file being acted upon.
- * @buf: Array of 'struct epoll' entries, to be inserted, modified, or removed
- *	 from the epoll file depending on their contents.
- * @bufsz: Number of 'struct epoll' entries in buffer times the size of the
- *	   structure.
- * @pos: Ignored, epoll files behave like character devices.
+ * @ep: The eventpoll being acted upon.
+ * @fd: File descriptor of eventpoll entry.
+ * @io: I/O events this triggering this eventpoll entry.
+ * @id: Userspace identifier of this eventpoll entry (meaningless to kernel).
  *
- * Returns: The number of bytes from the userspace buffer successfully processed,
- *	    always a multiple of sizeof(struct epoll), or an error code if the
- *	    buffer is ill-aligned or inaccessible (nothing will have been
- *	    processed).
+ * Returns: Zero if successful or an error code.
  */
-static ssize_t ep_eventpoll_write(struct file *file, const char __user *buf,
-				  size_t bufsz, loff_t *pos)
+static int ep_control(struct eventpoll *ep, int fd, int io, long long id)
 {
-	struct eventpoll *ep = file->private_data, *tep = NULL;
+	struct file *target = fget(fd);
+	struct eventpoll *tep = NULL;
 	struct epitem *epi;
-	struct file *target;
-	const struct epoll __user *epes = (const struct epoll __user *)buf;
-	struct epoll epe;
 	bool full_check = false;
-	size_t num = bufsz / sizeof(struct epoll); /* Ignore any excess */
-	int i;
+	int err;
 
-	if (!access_ok(VERIFY_READ, buf, bufsz))
-		return -EFAULT;
+	err = -EBADF;
+	if (!target)
+		goto out;
 
-	for (i = 0; i < num; ++i) {
+	/* The target file descriptor must support poll */
+	err = -EINVAL;
+	if (!target->f_op || !target->f_op->poll)
+		goto out_fput;
 
-		if (copy_from_user(&epe, &epes[i], sizeof(struct epoll)))
-			goto out;
+	/* Check if EPOLLWAKEUP is allowed */
+	if ((io & EPOLLWAKEUP) && !capable(CAP_BLOCK_SUSPEND))
+		io &= ~EPOLLWAKEUP;
 
-		target = fget(epe.ep_fildes);
-		if (target < 0)
-			goto out;
+	/* We do not permit adding an epoll file descriptor inside itself. */
+	if (target == ep->file)
+		goto out_fput;
 
-		/* The target file descriptor must support poll */
-		if (!target->f_op || !target->f_op->poll)
-			goto out_fput;
+	mutex_lock_nested(&ep->mtx, 0);
 
-		/* Check if EPOLLWAKEUP is allowed */
-		if ((epe.ep_events & EPOLLWAKEUP) && !capable(CAP_BLOCK_SUSPEND))
-			epe.ep_events &= ~EPOLLWAKEUP;
+	/* Try to lookup the file inside our RB tree */
+	epi = ep_find(ep, target, fd);
 
-		/* We do not permit adding an epoll file descriptor inside itself. */
-		if (target == file)
-			goto out_fput;
+	/*
+	 * When we insert an epoll file descriptor, inside another epoll
+	 * file descriptor, there is the chance of creating closed loops,
+	 * which are better handled here, than in more critical paths.
+	 * While we are checking for loops we also determine the list of
+	 * files reachable and hang them on the tfile_check_list, so we
+	 * can check that we haven't created too many possible wakeup
+	 * paths.
+	 *
+	 * We do not need to take the global 'epumutex' to ep_insert()
+	 * when the epoll file descriptor is attaching directly to a
+	 * wakeup source, unless the epoll file descriptor is nested.
+	 * The purpose of taking the 'epmutex' on add is to prevent
+	 * complex toplogies such as loops and deep wakeup paths from
+	 * forming in parallel through multiple ep_insert() operations.
+	 */
 
-		mutex_lock_nested(&ep->mtx, 0);
-
-		/* Try to lookup the file inside our RB tree */
-		epi = ep_find(ep, target, epe.ep_fildes);
-
-		/*
-		 * When we insert an epoll file descriptor, inside another epoll
-		 * file descriptor, there is the chance of creating closed loops,
-		 * which are better handled here, than in more critical paths.
-		 * While we are checking for loops we also determine the list of
-		 * files reachable and hang them on the tfile_check_list, so we
-		 * can check that we haven't created too many possible wakeup
-		 * paths.
-		 *
-		 * We do not need to take the global 'epumutex' to ep_insert()
-		 * when the epoll file descriptor is attaching directly to a
-		 * wakeup source, unless the epoll file descriptor is nested.
-		 * The purpose of taking the 'epmutex' on add is to prevent
-		 * complex toplogies such as loops and deep wakeup paths from
-		 * forming in parallel through multiple ep_insert() operations.
-		 */
-
-		if (epe.ep_events && !epi) {
-			/* add this epoll entry */
-			if (!list_empty(&file->f_ep_links) ||
+	if (io && !epi) {
+		/* add this eventpoll entry */
+		if (!list_empty(&ep->file->f_ep_links) ||
 							is_file_epoll(target)) {
-				full_check = true;
-				mutex_unlock(&ep->mtx);
-				mutex_lock(&epmutex);
-				if (is_file_epoll(target) &&
-						ep_loop_check(ep, target) != 0) {
-					clear_tfile_check_list();
-					goto out_fput;
-				} else if (!is_file_epoll(target)) {
-					list_add(&target->f_tfile_llink,
-							&tfile_check_list);
-				}
-				mutex_lock_nested(&ep->mtx, 0);
-				if (is_file_epoll(target)) {
-					tep = target->private_data;
-					mutex_lock_nested(&tep->mtx, 1);
-				}
-			}
-			epe.ep_events |= POLLERR | POLLHUP;
-			if (ep_insert(ep, epe.ep_ident, epe.ep_events, target,
-				      epe.ep_fildes, full_check))
-				goto out_unlock;
-			if (full_check)
+			full_check = true;
+			mutex_unlock(&ep->mtx);
+			mutex_lock(&epmutex);
+			if (is_file_epoll(target) &&
+					ep_loop_check(ep, target) != 0) {
 				clear_tfile_check_list();
-		} else if (epe.ep_events && epi) {
-			/* modify this epoll entry */
-			epe.ep_events |= POLLERR | POLLHUP;
-			if (ep_modify(ep, epi, epe.ep_ident, epe.ep_events))
-				goto out_unlock;
-		} else if (!epe.ep_events && epi) {
-			/* delete this epoll entry */
+				goto out_fput;
+			} else if (!is_file_epoll(target)) {
+				list_add(&target->f_tfile_llink,
+						&tfile_check_list);
+			}
+			mutex_lock_nested(&ep->mtx, 0);
 			if (is_file_epoll(target)) {
 				tep = target->private_data;
 				mutex_lock_nested(&tep->mtx, 1);
 			}
-			if (is_file_epoll(target))
-				mutex_lock_nested(&tep->mtx, 1);
-			if (ep_remove(ep, epi))
-				goto out_unlock;
 		}
-
-		if (tep)
-			mutex_unlock(&tep->mtx);
-		tep = NULL;
-		mutex_unlock(&ep->mtx);
+		io |= POLLERR | POLLHUP;
+		err = ep_insert(ep, id, io, target, fd, full_check);
 		if (full_check)
-			mutex_unlock(&epmutex);
-		fput(target);
+			clear_tfile_check_list();
+	} else if (io && epi) {
+		/* modify this eventpoll entry */
+		io |= POLLERR | POLLHUP;
+		err = ep_modify(ep, epi, id, io);
+	} else if (!io && epi) {
+		/* delete this eventpoll entry */
+		if (is_file_epoll(target)) {
+			tep = target->private_data;
+			mutex_lock_nested(&tep->mtx, 1);
+		}
+		if (is_file_epoll(target))
+			mutex_lock_nested(&tep->mtx, 1);
+		err = ep_remove(ep, epi);
 	}
-	goto out;
 
-out_unlock:
+	mutex_unlock(&ep->mtx);
 	if (tep)
 		mutex_unlock(&tep->mtx);
-	mutex_unlock(&ep->mtx);
+out_fput:
 	if (full_check)
 		mutex_unlock(&epmutex);
-out_fput:
 	fput(target);
 out:
-	return i * sizeof(struct epoll);
-}
-
-/**
- *
- * ep_eventpoll_read - Read triggered events from an epoll file, delivered to
- *		       userspace in 'struct epoll' packets. At most, as many
- *		       events that wholly fit within the buffer are returned,
- *		       with less being returned if the read times out.
- *
- * @file: The epoll file to retrieve events from.
- * @buf: Preallocated buffer into which the kernel will store epoll entries.
- * @bufsz: Size of buffer, which ought to be in multiples of the epoll entry
- *	   structure. If not, the kernel will store as many structs as will
- *	   wholly fit within the provided buffer, not exceeding EP_MAX_EVENTS.
- * @pos: Ignored, epoll behaves like a character device.
- *
- * Returns: The number of triggered epoll entries multiplied by the size of the
- *	    epoll entry structure.
- */
-ssize_t ep_eventpoll_read(struct file *file, char __user *buf, size_t bufsz,
-			  loff_t *pos)
-{
-	struct eventpoll *ep = file->private_data;
-	int tmp;
-
-	/* The event buffer must be of a reasonable size */
-	if (bufsz / sizeof(struct epoll) == 0 ||
-	    bufsz / sizeof(struct epoll) > EP_MAX_EVENTS)
-		return -EINVAL;
-
-	/* Verify that the area passed by the user is writeable */
-	if (!access_ok(VERIFY_WRITE, buf, bufsz))
-		return -EFAULT;
-
-	/* Time to fish for events ... */
-	tmp = ep_poll(file->private_data, buf, bufsz, ep->timeout,
-		      ep_send_epes);
-	return tmp < 0 ? tmp : (ssize_t)tmp * sizeof(struct epoll);
-}
-
-/*
- * ep_eventpoll_ioctl - configure an eventpoll's behavior.
- *
- * @cmd: An EPIOC_* control command.
- * @arg: A pointer whose type depends on @cmd (usually int).
- *
- * Returns: 0 on success or an errno code.
- */
-static long ep_eventpoll_ioctl(struct file *file, unsigned int cmd,
-			      unsigned long arg)
-{
-	struct eventpoll *ep = file->private_data;
-	switch (cmd) {
-	case EPIOC_GETTIMEOUT:
-		return put_user(ep->timeout, (int __user *)arg);
-	case EPIOC_SETTIMEOUT:
-		return get_user(ep->timeout, (int __user *)arg);
-	default:
-		return -EINVAL;
-	}
+	return err;
 }
 
 /*
@@ -2120,7 +1943,6 @@ SYSCALL_DEFINE1(epoll_create1, int, flags)
 	}
 	ep->file = file;
 	fd_install(fd, file);
-	ep->timeout = -1; /* infinite (i.e., no) timeout by default */
 	return fd;
 
 out_free_fd:
@@ -2139,6 +1961,61 @@ SYSCALL_DEFINE1(epoll_create, int, size)
 }
 
 /*
+ * This behaves like sys_epoll_ctl() and sys_epoll_wait() combined into one;
+ * it creates, modifies, or deletes eventpoll entries from the 'in' array and
+ * stores triggered eventpoll entries in the 'out' array.
+ */
+SYSCALL_DEFINE6(epoll, int, ep, const struct epoll __user *, in,
+		unsigned int, inc, struct epoll __user *, out,
+		unsigned int, outc, int, timeout)
+{
+	struct file *file = fget(ep);
+	unsigned int i;
+	int ret;
+
+	ret = -EBADF;
+	if (!file || !is_file_epoll(file))
+		goto out;
+
+input:
+	/* process input eventpoll entries */
+	if (!in || !inc)
+		goto output;
+
+	ret = -EFAULT;
+	if (!access_ok(VERIFY_READ, in, inc * sizeof(struct epoll)))
+		goto out;
+	for (i = 0; i < inc; ++i) {
+		int fd, io;
+		long long id;
+
+		ret = -EFAULT;
+		if (__get_user(fd, &in[i].ep_fildes) ||
+		    __get_user(io, &in[i].ep_events) ||
+		    __get_user(id, &in[i].ep_ident))
+			goto out;
+
+		ret = ep_control(file->private_data, fd, io, id);
+		if (ret)
+			goto out;
+	}
+
+output:
+	/* produce output eventpoll entries */
+	if (!out || !outc)
+		goto out;
+
+	ret = -EFAULT;
+	if (!access_ok(VERIFY_WRITE, out, outc * sizeof(struct epoll)))
+		goto out;
+	ret = ep_poll(file->private_data, out, outc * sizeof(struct epoll),
+		      timeout, ep_send_entries);
+out:
+	fput(file);
+	return ret;
+}
+
+/*
  * The following function implements the controller interface for
  * the eventpoll file that enables the insertion/removal/change of
  * file descriptors inside the interest set.
@@ -2146,27 +2023,23 @@ SYSCALL_DEFINE1(epoll_create, int, size)
 SYSCALL_DEFINE4(epoll_ctl, int, epfd, int, op, int, fd,
 		struct epoll_event __user *, event)
 {
-	struct epoll epe = { .ep_fildes = fd };
 	struct file *file = fget(epfd);
+	int io = 0;
+	long long id = 0;
 	int err;
 
-	err = -EBADF;
 	if (!file || !is_file_epoll(file))
-		goto out;
+		return -EBADF;
 
 	err = -EFAULT;
-	if (ep_op_has_event(op) &&
-			(get_user(epe.ep_events, (int *)&event->events) ||
-			 get_user(epe.ep_ident, (long long *)&event->data)))
+	if (ep_op_has_event(op) && (get_user(io, (int *)&event->events) ||
+				    get_user(id, (long long *)&event->data)))
 		goto out;
 
-	err = ep_eventpoll_write(file, (const char *)&epe,
-				 sizeof(struct epoll), NULL);
-	if (!err)
-		err = -EBADF;
+	err = ep_control(file->private_data, fd, io, id);
 out:
 	fput(file);
-	return err < 0 ? err : 0;
+	return err;
 }
 
 /*

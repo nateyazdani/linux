@@ -11,6 +11,7 @@
 #ifndef _LINUX_SYSCALLS_H
 #define _LINUX_SYSCALLS_H
 
+struct epoll;
 struct epoll_event;
 struct iattr;
 struct inode;
@@ -607,6 +608,9 @@ asmlinkage long sys_select(int n, fd_set __user *inp, fd_set __user *outp,
 asmlinkage long sys_old_select(struct sel_arg_struct __user *arg);
 asmlinkage long sys_epoll_create(int size);
 asmlinkage long sys_epoll_create1(int flags);
+asmlinkage long sys_epoll(int ep, const struct epoll __user *in,
+			  unsigned int inc, struct epoll __user *out,
+			  unsigned int outc, int timeout);
 asmlinkage long sys_epoll_ctl(int epfd, int op, int fd,
 				struct epoll_event __user *event);
 asmlinkage long sys_epoll_wait(int epfd, struct epoll_event __user *events,
