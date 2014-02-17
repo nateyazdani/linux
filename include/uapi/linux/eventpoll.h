@@ -65,7 +65,7 @@ struct epoll {
 	int ep_fildes; /* file descriptor */
 	int ep_events; /* triggering events */
 	long long ep_ident; /* entry ID (cf. epoll_event->data) */
-} EPOLL_PACKED; /* A.K.A. "epe" for "eventpoll entry" */
+} EPOLL_PACKED;
 
 #ifdef CONFIG_PM_SLEEP
 static inline void ep_take_care_of_epollwakeup(struct epoll_event *epev)
