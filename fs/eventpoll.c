@@ -1844,11 +1844,11 @@ static int ep_control(struct eventpoll *ep, int fd, int *io, long long id,
 	if (epi && op == EPOLL_CTL_ADD)
 		goto out_fput;
 	err = -ENOENT;
-	if (!epi && op == EPOLL_CTL_MOD || op == EPOLL_CTL_DEL)
-		goto out_fput
+	if (!epi && (op == EPOLL_CTL_MOD || op == EPOLL_CTL_DEL))
+		goto out_fput;
 
 	if (ep_op_has_event(op))
-		*io |= EPOLLERR | EPOLLHUP;
+		*io |= POLLERR | POLLHUP;
 
 	/*
 	 * When we insert an epoll file descriptor, inside another epoll
