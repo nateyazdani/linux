@@ -1794,22 +1794,18 @@ static void clear_tfile_check_list(void)
  * ep_control - Create, remove, or modify events to poll for. The eventpoll
  *	        distinguishes between eventpoll entries by file descriptor,
  *	        but it will also store a user-defined identifier along
- *	        with it. To modify an existing event, simply set
- *	        ->ep_fildes to the target file desciptor and set
- *	        ->ep_ident and ->ep_events to whatever values you wish
- *	        to change them to. To remove an event, set ->ep_fildes
- *	        to the relevant file descriptor and clear ->ep_events.
+ *	        with it. To modify an existing event, simply pass the target
+ *		file descriptor with a new I/O event mask and identifier.
  *
  * @ep: The eventpoll being acted upon.
  * @fd: File descriptor of eventpoll entry.
- * @io: Pointer to I/O events this triggering this eventpoll entry. Resulting
- *      event mask written back (cleared on error).
+ * @io: I/O events this triggering this eventpoll entry.
  * @id: Userspace identifier of this eventpoll entry (meaningless to kernel).
  * @op: EPOLL_CTL_* operation (optional, set to zero to ignore).
  *
  * Returns: Zero if successful or an error code.
  */
-static int ep_control(struct eventpoll *ep, int fd, int *io, long long id,
+static int ep_control(struct eventpoll *ep, int fd, int io, long long id,
 		      int op)
 {
 	struct file *target = fget(fd);
@@ -1828,8 +1824,8 @@ static int ep_control(struct eventpoll *ep, int fd, int *io, long long id,
 		goto out_fput;
 
 	/* Check if EPOLLWAKEUP is allowed */
-	if ((*io & EPOLLWAKEUP) && !capable(CAP_BLOCK_SUSPEND))
-		*io &= ~EPOLLWAKEUP;
+	if ((io & EPOLLWAKEUP) && !capable(CAP_BLOCK_SUSPEND))
+		io &= ~EPOLLWAKEUP;
 
 	/* We do not permit adding an epoll file descriptor inside itself. */
 	if (target == ep->file)
@@ -1848,7 +1844,7 @@ static int ep_control(struct eventpoll *ep, int fd, int *io, long long id,
 		goto out_fput;
 
 	if (ep_op_has_event(op))
-		*io |= POLLERR | POLLHUP;
+		io |= POLLERR | POLLHUP;
 
 	/*
 	 * When we insert an epoll file descriptor, inside another epoll
@@ -1867,7 +1863,7 @@ static int ep_control(struct eventpoll *ep, int fd, int *io, long long id,
 	 * forming in parallel through multiple ep_insert() operations.
 	 */
 
-	if (*io && !epi) {
+	if (io && !epi) {
 		/* add this eventpoll entry */
 		err = -ENOENT; /* clearly this entry does not exist */
 		if (op && op != EPOLL_CTL_ADD)
@@ -1891,24 +1887,22 @@ static int ep_control(struct eventpoll *ep, int fd, int *io, long long id,
 				mutex_lock_nested(&tep->mtx, 1);
 			}
 		}
-		*io |= POLLERR | POLLHUP;
-		err = ep_insert(ep, id, *io, target, fd, full_check);
+		io |= POLLERR | POLLHUP;
+		err = ep_insert(ep, id, io, target, fd, full_check);
 		if (full_check)
 			clear_tfile_check_list();
-	} else if (*io && epi) {
+	} else if (io && epi) {
 		/* modify this eventpoll entry */
 		if (op && op != EPOLL_CTL_MOD)
 			goto out_fput;
-		*io |= POLLERR | POLLHUP;
-		err = ep_modify(ep, epi, id, *io);
-	} else if (!(*io) && epi) {
+		io |= POLLERR | POLLHUP;
+		err = ep_modify(ep, epi, id, io);
+	} else if (!io && epi) {
 		/* delete this eventpoll entry */
 		if (is_file_epoll(target)) {
 			tep = target->private_data;
 			mutex_lock_nested(&tep->mtx, 1);
 		}
-		if (is_file_epoll(target))
-			mutex_lock_nested(&tep->mtx, 1);
 		err = ep_remove(ep, epi);
 	}
 
@@ -1921,7 +1915,7 @@ out_fput:
 	fput(target);
 out:
 	if (err)
-		*io = 0; /* nothing can trigger a nonexistant entry */
+		io = 0; /* nothing can trigger a nonexistant entry */
 	return err;
 }
 
@@ -1984,10 +1978,7 @@ SYSCALL_DEFINE1(epoll_create, int, size)
  * This behaves like sys_epoll_ctl() and sys_epoll_wait() combined into one;
  * it creates, modifies, or deletes eventpoll entries from the 'in' array and
  * stores triggered eventpoll entries in the 'out' array. The input array is
- * _not_ read-only, because the resulting event mask gets written back to each
- * entry's ->ep_events field. When successful, this will be the same as before
- * (plus EPOLLERR & EPOLLHUP). If ->ep_events is cleared, then it is reasonable
- * to infer that the entry's ->ep_fildes was a bad file descriptor.
+ * _not_ read-only; on error, the ->ep_events field is cleared.
  */
 SYSCALL_DEFINE6(epoll, int, ep, struct epoll __user *, in,
 		unsigned int, inc, struct epoll __user *, out,
@@ -2006,23 +1997,20 @@ input:
 	if (!in || !inc)
 		goto output;
 
-	ret = -EFAULT;
 	if (!access_ok(VERIFY_WRITE, in, inc * sizeof(struct epoll)))
-		goto out;
+		goto fault;
 	for (i = 0; i < inc; ++i) {
 		int fd, io;
 		long long id;
 
-		ret = -EFAULT;
 		if (__get_user(fd, &in[i].ep_fildes) ||
 		    __get_user(io, &in[i].ep_events) ||
 		    __get_user(id, &in[i].ep_ident))
-			goto out;
+			goto fault;
 
-		ep_control(file->private_data, fd, &io, id, 0);
-		ret = -EFAULT;
-		if (__put_user(io, &in[i].ep_events))
-			goto out;
+		ret = ep_control(file->private_data, fd, io, id, 0);
+		if (ret && __put_user(0, &in[i].ep_events))
+			goto fault;
 	}
 
 output:
@@ -2030,11 +2018,13 @@ output:
 	if (!out || !outc)
 		goto out;
 
-	ret = -EFAULT;
 	if (!access_ok(VERIFY_WRITE, out, outc * sizeof(struct epoll)))
-		goto out;
+		goto fault;
 	ret = ep_poll(file->private_data, out, outc * sizeof(struct epoll),
 		      timeout, ep_send_entries);
+	goto out;
+fault:
+	ret = -EFAULT;
 out:
 	fput(file);
 	return ret;
@@ -2061,7 +2051,7 @@ SYSCALL_DEFINE4(epoll_ctl, int, epfd, int, op, int, fd,
 				    get_user(id, (long long *)&event->data)))
 		goto out;
 
-	err = ep_control(file->private_data, fd, &io, id, op);
+	err = ep_control(file->private_data, fd, io, id, op);
 out:
 	fput(file);
 	return err;
