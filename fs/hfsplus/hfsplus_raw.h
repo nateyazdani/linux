@@ -4,6 +4,7 @@
  * Copyright (C) 1999
  * Brad Boyer (flar@pants.nu)
  * (C) 2003 Ardis Technologies <roman@ardistech.com>
+ * (C) 2013 Nathaniel Yazdani <n1ght.4nd.d4y@gmail.com>
  *
  * Format of structures on disk
  * Information taken from Apple Technote #1150 (HFS Plus Volume Format)
@@ -105,7 +106,7 @@ struct hfsplus_vh {
 	__be16 version;
 	__be32 attributes;
 	__be32 last_mount_vers;
-	u32 reserved;
+	__be32 jinfo_blk;
 
 	__be32 create_date;
 	__be32 modify_date;
@@ -144,6 +145,54 @@ struct hfsplus_vh {
 #define HFSPLUS_VOL_NODEID_REUSED	(1 << 12)
 #define HFSPLUS_VOL_JOURNALED		(1 << 13)
 #define HFSPLUS_VOL_SOFTLOCK		(1 << 15)
+
+/* HFS+ journal information block */
+struct hfsplus_jinfo {
+	__be32 flags;
+	__be32 dev_sig; /* undefined and hence ignored */
+	__be64 offset;
+	__be64 length;
+	__be32 reserved[32];
+} __packed;
+
+/* HFS+ journal information flags */
+#define HFSPLUS_JINFO_INTERNAL 0x01
+#define HFSPLUS_JINFO_EXTERNAL 0x02
+#define HFSPLUS_JINFO_NEED_INIT 0x04
+
+struct hfsplus_jhdr {
+	__be32 magic;
+	__be32 endian;
+	__be64 oldest;
+	__be64 newest;
+	__be64 length;
+	__be32 blist_sz; /* size of a block list, minus payload */
+	__be32 checksum;
+	__be32 jhdr_sz; /* must equal the disk block size */
+} __packed;
+
+#define HFSPLUS_JHDR_MAGIC 0x4a4e4c78
+#define HFSPLUS_JHDR_ENDIAN 0x12345678
+
+/* HFS+ journal block list entry */
+struct hfsplus_blent {
+	__be64 block;
+	__be32 bytes;
+	__be32 next; /* if ([0].next != 0) then multi-list */
+} __packed;
+
+/* this value for the '.block' field indicates that the entry must be skipped */
+#define HFSPLUS_BLENT_SKIP (~(__be64)0)
+
+/* HFS+ block list header */
+struct hfsplus_blhdr {
+	__be16 reserved;
+	__be16 count;
+	__be32 length; /* includes data payload(s) */
+	__be32 checksum;
+	__be32 padding;
+	struct hfsplus_blent info[1]; /* first entry is special */
+} __packed;
 
 /* HFS+ BTree node descriptor */
 struct hfs_bnode_desc {

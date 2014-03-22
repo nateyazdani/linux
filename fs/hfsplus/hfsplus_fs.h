@@ -160,6 +160,21 @@ struct hfsplus_sb_info {
 	sector_t sect_count;
 	int fs_shift;
 
+	/* Journaling */
+	bool journaling;
+	struct mutex journal_mtx; /* serializes writes to journal & offsets */
+	struct hfsplus_jhdr *journal_hdr; /* always consistent with disk */
+	struct bio *journal_bio; /* queue when flushing */
+	sector_t journal; /* always exactly one block before '->journal_buf' */
+	sector_t journal_buf;
+	sector_t journal_len;
+	sector_t journal_ptr; /* allocated space */
+	sector_t journal_cur; /* written space */
+	sector_t journal_fin; /* transacted space */
+	sector_t journal_end;
+	uint32_t blist_len; /* constant size of a block list */
+	uint16_t blist_num; /* constant length of a block list */
+
 	/* immutable data from the volume header */
 	u32 alloc_blksz;
 	int alloc_blksz_shift;
@@ -478,9 +493,18 @@ struct inode *hfsplus_new_inode(struct super_block *, umode_t);
 void hfsplus_delete_inode(struct inode *);
 int hfsplus_file_fsync(struct file *file, loff_t start, loff_t end,
 		       int datasync);
+sector_t hfsplus_bmap(struct address_space *mapping, sector_t block);
 
 /* ioctl.c */
 long hfsplus_ioctl(struct file *filp, unsigned int cmd, unsigned long arg);
+
+/* journal.c */
+__be32 hfsplus_calc_chksum(const void *ptr, size_t len);
+int hfsplus_create_journal(struct super_block *sb);
+int hfsplus_replay_journal(struct super_block *sb);
+int hfsplus_start_transact(struct super_block *sb);
+int hfsplus_stop_transact(int err);
+int hfsplus_transact_page(struct page *page);
 
 /* options.c */
 int hfsplus_parse_options(char *, struct hfsplus_sb_info *);
@@ -511,10 +535,11 @@ int hfsplus_compare_dentry(const struct dentry *parent, const struct dentry *den
 		unsigned int len, const char *str, const struct qstr *name);
 
 /* wrapper.c */
-int hfsplus_read_wrapper(struct super_block *);
+int hfsplus_load_super(struct super_block *);
+int hfsplus_load_journal(struct super_block *);
 int hfs_part_find(struct super_block *, sector_t *, sector_t *);
-int hfsplus_submit_bio(struct super_block *sb, sector_t sector,
-		void *buf, void **data, int rw);
+int hfsplus_submit_bio(struct super_block *sb, sector_t sector, void *buf,
+							void **data, int rw);
 
 /* time macros */
 #define __hfsp_mt2ut(t)		(be32_to_cpu(t) - 2082844800U)

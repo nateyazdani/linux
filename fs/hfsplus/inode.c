@@ -57,7 +57,7 @@ static int hfsplus_write_begin(struct file *file, struct address_space *mapping,
 	return ret;
 }
 
-static sector_t hfsplus_bmap(struct address_space *mapping, sector_t block)
+sector_t hfsplus_bmap(struct address_space *mapping, sector_t block)
 {
 	return generic_block_bmap(mapping, block, hfsplus_get_block);
 }

@@ -125,7 +125,7 @@ found:
 			*curr++ = cpu_to_be32(0xffffffff);
 			len -= 32;
 		}
-		set_page_dirty(page);
+		hfsplus_transact_page(page);
 		kunmap(page);
 		offset += PAGE_CACHE_BITS;
 		page = read_mapping_page(mapping, offset / PAGE_CACHE_BITS,
@@ -149,7 +149,7 @@ last:
 	}
 done:
 	*curr = cpu_to_be32(n);
-	set_page_dirty(page);
+	hfsplus_transact_page(page);
 	kunmap(page);
 	*max = offset + (curr - pptr) * 32 + i - start;
 	sbi->free_blocks -= *max;
@@ -213,7 +213,7 @@ int hfsplus_block_free(struct super_block *sb, u32 offset, u32 count)
 		}
 		if (!count)
 			break;
-		set_page_dirty(page);
+		hfsplus_transact_page(page);
 		kunmap(page);
 		page = read_mapping_page(mapping, ++pnr, NULL);
 		if (IS_ERR(page))
@@ -229,7 +229,7 @@ done:
 		*curr &= cpu_to_be32(mask);
 	}
 out:
-	set_page_dirty(page);
+	hfsplus_transact_page(page);
 	kunmap(page);
 	sbi->free_blocks += len;
 	hfsplus_mark_mdb_dirty(sb);

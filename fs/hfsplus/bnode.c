@@ -82,14 +82,14 @@ void hfs_bnode_write(struct hfs_bnode *node, void *buf, int off, int len)
 
 	l = min(len, (int)PAGE_CACHE_SIZE - off);
 	memcpy(kmap(*pagep) + off, buf, l);
-	set_page_dirty(*pagep);
+	hfsplus_transact_page(*pagep);
 	kunmap(*pagep);
 
 	while ((len -= l) != 0) {
 		buf += l;
 		l = min(len, (int)PAGE_CACHE_SIZE);
 		memcpy(kmap(*++pagep), buf, l);
-		set_page_dirty(*pagep);
+		hfsplus_transact_page(*pagep);
 		kunmap(*pagep);
 	}
 }
@@ -112,13 +112,13 @@ void hfs_bnode_clear(struct hfs_bnode *node, int off, int len)
 
 	l = min(len, (int)PAGE_CACHE_SIZE - off);
 	memset(kmap(*pagep) + off, 0, l);
-	set_page_dirty(*pagep);
+	hfsplus_transact_page(*pagep);
 	kunmap(*pagep);
 
 	while ((len -= l) != 0) {
 		l = min(len, (int)PAGE_CACHE_SIZE);
 		memset(kmap(*++pagep), 0, l);
-		set_page_dirty(*pagep);
+		hfsplus_transact_page(*pagep);
 		kunmap(*pagep);
 	}
 }
@@ -145,14 +145,14 @@ void hfs_bnode_copy(struct hfs_bnode *dst_node, int dst,
 		l = min(len, (int)PAGE_CACHE_SIZE - src);
 		memcpy(kmap(*dst_page) + src, kmap(*src_page) + src, l);
 		kunmap(*src_page);
-		set_page_dirty(*dst_page);
+		hfsplus_transact_page(*dst_page);
 		kunmap(*dst_page);
 
 		while ((len -= l) != 0) {
 			l = min(len, (int)PAGE_CACHE_SIZE);
 			memcpy(kmap(*++dst_page), kmap(*++src_page), l);
 			kunmap(*src_page);
-			set_page_dirty(*dst_page);
+			hfsplus_transact_page(*dst_page);
 			kunmap(*dst_page);
 		}
 	} else {
@@ -173,7 +173,7 @@ void hfs_bnode_copy(struct hfs_bnode *dst_node, int dst,
 			l = min(len, l);
 			memcpy(dst_ptr, src_ptr, l);
 			kunmap(*src_page);
-			set_page_dirty(*dst_page);
+			hfsplus_transact_page(*dst_page);
 			kunmap(*dst_page);
 			if (!dst)
 				dst_page++;
@@ -205,7 +205,7 @@ void hfs_bnode_move(struct hfs_bnode *node, int dst, int src, int len)
 			while (src < len) {
 				memmove(kmap(*dst_page), kmap(*src_page), src);
 				kunmap(*src_page);
-				set_page_dirty(*dst_page);
+				hfsplus_transact_page(*dst_page);
 				kunmap(*dst_page);
 				len -= src;
 				src = PAGE_CACHE_SIZE;
@@ -216,7 +216,7 @@ void hfs_bnode_move(struct hfs_bnode *node, int dst, int src, int len)
 			memmove(kmap(*dst_page) + src,
 				kmap(*src_page) + src, len);
 			kunmap(*src_page);
-			set_page_dirty(*dst_page);
+			hfsplus_transact_page(*dst_page);
 			kunmap(*dst_page);
 		} else {
 			void *src_ptr, *dst_ptr;
@@ -236,7 +236,7 @@ void hfs_bnode_move(struct hfs_bnode *node, int dst, int src, int len)
 				l = min(len, l);
 				memmove(dst_ptr - l, src_ptr - l, l);
 				kunmap(*src_page);
-				set_page_dirty(*dst_page);
+				hfsplus_transact_page(*dst_page);
 				kunmap(*dst_page);
 				if (dst == PAGE_CACHE_SIZE)
 					dst_page--;
@@ -255,7 +255,7 @@ void hfs_bnode_move(struct hfs_bnode *node, int dst, int src, int len)
 			memmove(kmap(*dst_page) + src,
 				kmap(*src_page) + src, l);
 			kunmap(*src_page);
-			set_page_dirty(*dst_page);
+			hfsplus_transact_page(*dst_page);
 			kunmap(*dst_page);
 
 			while ((len -= l) != 0) {
@@ -263,7 +263,7 @@ void hfs_bnode_move(struct hfs_bnode *node, int dst, int src, int len)
 				memmove(kmap(*++dst_page),
 					kmap(*++src_page), l);
 				kunmap(*src_page);
-				set_page_dirty(*dst_page);
+				hfsplus_transact_page(*dst_page);
 				kunmap(*dst_page);
 			}
 		} else {
@@ -285,7 +285,7 @@ void hfs_bnode_move(struct hfs_bnode *node, int dst, int src, int len)
 				l = min(len, l);
 				memmove(dst_ptr, src_ptr, l);
 				kunmap(*src_page);
-				set_page_dirty(*dst_page);
+				hfsplus_transact_page(*dst_page);
 				kunmap(*dst_page);
 				if (!dst)
 					dst_page++;
@@ -603,11 +603,11 @@ struct hfs_bnode *hfs_bnode_create(struct hfs_btree *tree, u32 num)
 	pagep = node->page;
 	memset(kmap(*pagep) + node->page_offset, 0,
 	       min((int)PAGE_CACHE_SIZE, (int)tree->node_size));
-	set_page_dirty(*pagep);
+	hfsplus_transact_page(*pagep);
 	kunmap(*pagep);
 	for (i = 1; i < tree->pages_per_bnode; i++) {
 		memset(kmap(*++pagep), 0, PAGE_CACHE_SIZE);
-		set_page_dirty(*pagep);
+		hfsplus_transact_page(*pagep);
 		kunmap(*pagep);
 	}
 	clear_bit(HFS_BNODE_NEW, &node->flags);

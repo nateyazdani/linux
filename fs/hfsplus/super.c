@@ -145,21 +145,25 @@ static int hfsplus_write_inode(struct inode *inode,
 {
 	int err;
 
+	hfsplus_start_transact(inode->i_sb);
 	hfs_dbg(INODE, "hfsplus_write_inode: %lu\n", inode->i_ino);
 
 	err = hfsplus_ext_write_extent(inode);
 	if (err)
-		return err;
+		goto out;
 
 	if (inode->i_ino >= HFSPLUS_FIRSTUSER_CNID ||
 	    inode->i_ino == HFSPLUS_ROOT_CNID)
-		return hfsplus_cat_write_inode(inode);
+		err = hfsplus_cat_write_inode(inode);
 	else
-		return hfsplus_system_write_inode(inode);
+		err = hfsplus_system_write_inode(inode);
+out:
+	return hfsplus_stop_transact(err);
 }
 
 static void hfsplus_evict_inode(struct inode *inode)
 {
+	hfsplus_start_transact(inode->i_sb);
 	hfs_dbg(INODE, "hfsplus_evict_inode: %lu\n", inode->i_ino);
 	truncate_inode_pages(&inode->i_data, 0);
 	clear_inode(inode);
@@ -167,6 +171,7 @@ static void hfsplus_evict_inode(struct inode *inode)
 		HFSPLUS_I(HFSPLUS_I(inode)->rsrc_inode)->rsrc_inode = NULL;
 		iput(HFSPLUS_I(inode)->rsrc_inode);
 	}
+	hfsplus_stop_transact(0);
 }
 
 static int hfsplus_sync_fs(struct super_block *sb, int wait)
@@ -404,7 +409,7 @@ static int hfsplus_fill_super(struct super_block *sb, void *data, int silent)
 	}
 
 	/* Grab the volume header */
-	if (hfsplus_read_wrapper(sb)) {
+	if (hfsplus_load_super(sb)) {
 		if (!silent)
 			pr_warn("unable to find HFS+ superblock\n");
 		goto out_unload_nls;

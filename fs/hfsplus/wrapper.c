@@ -152,9 +152,9 @@ static int hfsplus_get_last_session(struct super_block *sb,
 	return 0;
 }
 
-/* Find the volume header and fill in some minimum bits in superblock */
-/* Takes in super block, returns true if good data read */
-int hfsplus_read_wrapper(struct super_block *sb)
+/* Find the volume header and fill in some minimum bits in superblock,
+ * returning true if good data read */
+int hfsplus_load_super(struct super_block *sb)
 {
 	struct hfsplus_sb_info *sbi = HFSPLUS_SB(sb);
 	struct hfsplus_wd wd;
@@ -259,5 +259,118 @@ out_free_backup_vhdr:
 out_free_vhdr:
 	kfree(sbi->s_vhdr_buf);
 out:
+	return error;
+}
+
+/*
+ * Locate journal, load the header, and initialize the journaling fields of the
+ * given superblock.  If the journal is present, valid, and usable,
+ * sbi->journaling will be set to true.
+ */
+int hfsplus_load_journal(struct super_block *sb)
+{
+	struct hfsplus_sb_info *sbi = HFSPLUS_SB(sb);
+	struct hfsplus_vh *vh = sbi->s_vhdr;
+	struct hfsplus_jinfo *jinfo;
+	struct hfsplus_jhdr *jhdr;
+	__be32 chksum;
+	int error;
+
+	/* load the journal info. block to extract the journaling metadata */
+	error = -ENOMEM;
+	jinfo = kmalloc(hfsplus_min_io_size(sb), GFP_KERNEL);
+	if (!jinfo)
+		goto err;
+	error = hfsplus_submit_bio(sb, sbi->part_start +
+			(sector_t)(be32_to_cpu(vh->jinfo_blk) * sbi->alloc_blksz
+			>> HFSPLUS_SECTOR_SHIFT), jinfo, NULL, READ);
+	if (error)
+		goto err;
+
+	if (!(be32_to_cpu(jinfo->flags) & HFSPLUS_JINFO_INTERNAL) ||
+			be32_to_cpu(jinfo->flags) & HFSPLUS_JINFO_EXTERNAL) {
+		/* the spec. says to reject external journals */
+		pr_warn("external journal unsupported\n");
+		error = -EINVAL;
+		goto err_free_jinfo;
+	}
+
+	/* initialize various journaling runtime parameters */
+	sbi->journal = sbi->part_start + (be64_to_cpu(jinfo->offset)
+						>> HFSPLUS_SECTOR_SHIFT);
+	sbi->journal_buf = sbi->journal + (sb->s_blocksize
+						>> HFSPLUS_SECTOR_SHIFT);
+	sbi->journal_len = (be64_to_cpu(jinfo->length) - sb->s_blocksize)
+						>> HFSPLUS_SECTOR_SHIFT;
+
+	/* load the journal header and retain it in memory  */
+	error = -ENOMEM;
+	jhdr = sbi->journal_hdr = kmalloc(hfsplus_min_io_size(sb), GFP_KERNEL);
+	if (!jhdr)
+		goto err_free_jinfo;
+
+	if (be32_to_cpu(jinfo->flags) & HFSPLUS_JINFO_NEED_INIT) {
+		/* initialize journal header */
+		jhdr->magic = cpu_to_be32(HFSPLUS_JHDR_MAGIC);
+		jhdr->endian = cpu_to_be32(HFSPLUS_JHDR_ENDIAN);
+		jhdr->oldest = jhdr->newest = cpu_to_be64(sb->s_blocksize);
+		jhdr->length = jinfo->length;
+		jhdr->blist_sz = cpu_to_be32(4096); /* average value */
+		jhdr->jhdr_sz = cpu_to_be32(sb->s_blocksize);
+		jhdr->checksum = 0;
+		jhdr->checksum = hfsplus_calc_chksum(jhdr,
+						sizeof(struct hfsplus_jhdr));
+		error = hfsplus_submit_bio(sb, sbi->journal, jhdr, NULL,
+								WRITE_SYNC);
+		if (error)
+			goto err_free_jhdr;
+
+		jinfo->flags ^= cpu_to_be32(HFSPLUS_JINFO_NEED_INIT);
+		error = hfsplus_submit_bio(sb, sbi->part_start +
+				(sector_t)(be32_to_cpu(vh->jinfo_blk)
+				* sbi->alloc_blksz >> HFSPLUS_SECTOR_SHIFT),
+				jinfo, NULL, WRITE_SYNC);
+	} else {
+		error = hfsplus_submit_bio(sb, sbi->journal, jhdr, NULL, READ);
+		if (error)
+			goto err_free_jhdr;
+	}
+
+	chksum = jhdr->checksum;
+	jhdr->checksum = 0;
+	jhdr->checksum = hfsplus_calc_chksum(jhdr, sizeof(struct hfsplus_jhdr));
+	if (jhdr->checksum != chksum
+			|| be32_to_cpu(jhdr->magic) != HFSPLUS_JHDR_MAGIC
+			|| be32_to_cpu(jhdr->endian) != HFSPLUS_JHDR_ENDIAN) {
+		/* journal header is corrupt */
+		pr_crit("corrupt journal header on %s\n", sb->s_id);
+		error = -EINVAL;
+		goto err_free_jhdr;
+	}
+
+	sbi->journal_cur = be64_to_cpu(jhdr->newest) >> HFSPLUS_SECTOR_SHIFT;
+	sbi->journal_end = be64_to_cpu(jhdr->oldest) >> HFSPLUS_SECTOR_SHIFT;
+	sbi->blist_len = be32_to_cpu(jhdr->blist_sz);
+
+	/* replay & clear journal */
+	error = hfsplus_replay_journal(sb);
+	if (error)
+		goto err_free_jhdr;
+
+	kfree(jinfo);
+	sbi->journal_cur = sbi->journal_end = sbi->journal_buf;
+	sbi->journaling = true;
+	goto out;
+
+err_free_jhdr:
+	kfree(jhdr);
+err_free_jinfo:
+	kfree(jinfo);
+err:
+	sbi->journaling = false;
+	sbi->journal_hdr = NULL;
+
+out:
+	mutex_init(&sbi->journal_mtx);
 	return error;
 }
