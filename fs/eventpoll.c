@@ -250,12 +250,9 @@ struct ep_pqueue {
 
 /* Used by the ep_send_events() function as callback private data */
 struct ep_send_data {
-	union {
-		struct epoll_event __user *uevent;
-		struct epoll __user *uentry;
-	};
-	unsigned int max;
-	enum { EPOLL_EVENT, EPOLL_ENTRY } api;
+	void __user *buf;
+	size_t len;
+	ssize_t (*put)(void __user *, int, int, long long);
 };
 
 /*
@@ -1475,10 +1472,25 @@ static int ep_modify(struct eventpoll *ep, struct epitem *epi, long long ident,
 	return 0;
 }
 
+static ssize_t ep_put_event(void __user *ptr, int fd, int io, long long id)
+{
+	struct epoll_event __user *epds = ptr;
+	return (__put_user(id, &epds->data)) ||
+		__put_user(io, &epds->events) ? 0 : sizeof(struct epoll_event);
+}
+
+static ssize_t ep_put_entry(void __user *ptr, int fd, int io, long long id)
+{
+	struct epollfd __user *epe = ptr;
+	return (__put_user(fd, &epe->fildes) ||
+		__put_user(io, &epe->events) ||
+		__put_user(id, &epe->ident)) ? 0 : sizeof(struct epollfd);
+}
+
 static int ep_send_proc(struct eventpoll *ep, struct list_head *head, void *priv)
 {
 	struct ep_send_data *esd = priv;
-	int i;
+	size_t cur, pos = 0;
 	unsigned int revents;
 	struct epitem *epi;
 	struct wakeup_source *ws;
@@ -1491,7 +1503,7 @@ static int ep_send_proc(struct eventpoll *ep, struct list_head *head, void *priv
 	 * Items cannot vanish during the loop because ep_scan_ready_list() is
 	 * holding "mtx" during this call.
 	 */
-	for (i = 0; !list_empty(head) && i < esd->max; ++i) {
+	while (!list_empty(head) && pos < esd->len) {
 		epi = list_first_entry(head, struct epitem, rdllink);
 
 		/*
@@ -1523,24 +1535,14 @@ static int ep_send_proc(struct eventpoll *ep, struct list_head *head, void *priv
 		 * is holding "mtx", so no operations coming from userspace
 		 * can change the item.
 		 */
-		if (esd->api == EPOLL_ENTRY &&
-			(__put_user(epi->ffd.fd, &esd->uentry[i].ep_fildes) ||
-			 __put_user(revents, &esd->uentry[i].ep_events) ||
-			 __put_user(epi->ident, &esd->uentry[i].ep_ident))) {
-
+		cur = esd->put((char *)esd->buf + pos, epi->ffd.fd, revents,
+			       epi->ident);
+		if (!cur) {
 			list_add(&epi->rdllink, head);
 			ep_pm_stay_awake(epi);
-			return i ? i : -EFAULT;
-		} else if (esd->api == EPOLL_EVENT &&
-			(__put_user(revents, &esd->uevent[i].events) ||
-			 __put_user(epi->ident, &esd->uevent[i].data))) {
-
-			list_add(&epi->rdllink, head);
-			ep_pm_stay_awake(epi);
-			return i ? i : -EFAULT;
-		} else {
-			return -EINVAL;
+			return pos ? pos : -EFAULT;
 		}
+		pos += cur;
 
 		if (epi->events & EPOLLONESHOT)
 			epi->events &= EP_PRIVATE_BITS;
@@ -1561,23 +1563,23 @@ static int ep_send_proc(struct eventpoll *ep, struct list_head *head, void *priv
 		}
 	}
 
-	return i;
+	return pos;
 }
 
 static int ep_send_events(struct eventpoll *ep, void __user *buf, size_t len)
 {
-	struct ep_send_data esd = { .uevent = buf,
-				    .max = len / sizeof(struct epoll_event),
-				    .api = EPOLL_ENTRY };
+	struct ep_send_data esd = { .buf = buf,
+				    .len = len,
+				    .put = ep_put_event };
 
 	return ep_scan_ready_list(ep, ep_send_proc, &esd, 0, false);
 }
 
 static int ep_send_entries(struct eventpoll *ep, void __user *buf, size_t len)
 {
-	struct ep_send_data esd = { .uentry = buf,
-				    .max = len / sizeof(struct epoll),
-				    .api = EPOLL_ENTRY };
+	struct ep_send_data esd = { .buf = buf,
+				    .len = len,
+				    .put = ep_put_entry };
 
 	return ep_scan_ready_list(ep, ep_send_proc, &esd, 0, false);
 }
@@ -1605,12 +1607,11 @@ static inline struct timespec ep_set_mstimeout(long ms)
  *           milliseconds. If the @timeout is zero, the function will not block,
  *           while if the @timeout is less than zero, the function will block
  *           until at least one event has been retrieved (or an error
- *           occurred). Flags set on the eventpoll itself, e.g., EPOLL_MONOTIME
- *	     and EPOLL_REALTIME, may affect the exact behavior of timeouts.
+ *           occurred).
  * @sender: Function to call to send ready events to userspace.
  *
- * Returns: Returns the number of ready events which have been fetched, or an
- *          error code, in case of error.
+ * Returns: Returns the number of bytes written out into the userspace buffer
+ *          by @sender or an error code, in case of error.
  */
 static int ep_poll(struct eventpoll *ep, void __user *buffer, size_t length,
 		   long timeout, int (*sender)(struct eventpoll *,
@@ -1836,6 +1837,7 @@ static int ep_control(struct eventpoll *ep, int fd, int io, long long id,
 	/* Try to lookup the file inside our RB tree */
 	epi = ep_find(ep, target, fd);
 
+	/* Preserve old epoll_ctl() behavior */
 	err = -EEXIST;
 	if (epi && op == EPOLL_CTL_ADD)
 		goto out_fput;
@@ -1865,9 +1867,6 @@ static int ep_control(struct eventpoll *ep, int fd, int io, long long id,
 
 	if (io && !epi) {
 		/* add this eventpoll entry */
-		err = -ENOENT; /* clearly this entry does not exist */
-		if (op && op != EPOLL_CTL_ADD)
-			goto out_fput;
 		if (!list_empty(&ep->file->f_ep_links) ||
 							is_file_epoll(target)) {
 			full_check = true;
@@ -1975,59 +1974,56 @@ SYSCALL_DEFINE1(epoll_create, int, size)
 }
 
 /*
- * This behaves like sys_epoll_ctl() and sys_epoll_wait() combined into one;
- * it creates, modifies, or deletes eventpoll entries from the 'in' array and
- * stores triggered eventpoll entries in the 'out' array. The input array is
- * _not_ read-only; on error, the ->ep_events field is cleared.
+ * Insert/modify an array of eventpoll entries and retrieve an array of ready
+ * eventpoll entries in epollfd structures (the epoll(2) syscall). Note: if
+ * an input eventpoll entry has an eventmask of 0 (i.e., untriggerable), this
+ * is taken to mean remove the entry. Additionally, invalid input epollfd
+ * structures trigger POLLNVAL on their ident/fildes.
  */
-SYSCALL_DEFINE6(epoll, int, ep, struct epoll __user *, in,
-		unsigned int, inc, struct epoll __user *, out,
-		unsigned int, outc, int, timeout)
+SYSCALL_DEFINE6(epoll, int, ep, const struct epollfd __user *, infds,
+		unsigned int, infdc, struct epollfd __user *, outfds,
+		unsigned int, outfdc, int, timeout)
 {
 	struct file *file = fget(ep);
-	unsigned int i;
 	int ret;
 
 	ret = -EBADF;
 	if (!file || !is_file_epoll(file))
 		goto out;
+	ret = -EFAULT;
+	if (!access_ok(VERIFY_READ, infds, infdc * sizeof(struct epollfd)) ||
+	    !access_ok(VERIFY_WRITE, outfds, outfdc * sizeof(struct epollfd)))
+		goto out;
 
-input:
 	/* process input eventpoll entries */
-	if (!in || !inc)
-		goto output;
-
-	if (!access_ok(VERIFY_WRITE, in, inc * sizeof(struct epoll)))
-		goto fault;
-	for (i = 0; i < inc; ++i) {
+	for (; infds && infdc; infds++, infdc--) {
 		int fd, io;
 		long long id;
 
-		if (__get_user(fd, &in[i].ep_fildes) ||
-		    __get_user(io, &in[i].ep_events) ||
-		    __get_user(id, &in[i].ep_ident))
-			goto fault;
+		if (__get_user(fd, &infds->fildes) ||
+		    __get_user(io, &infds->events) ||
+		    __get_user(id, &infds->ident))
+			goto out;
 
-		ret = ep_control(file->private_data, fd, io, id, 0);
-		if (ret && __put_user(0, &in[i].ep_events))
-			goto fault;
+		if (ep_control(file->private_data, fd, io, id, 0)) {
+			if (!ep_put_entry(outfds, fd, POLLNVAL, id))
+				goto out;
+			outfds++;
+			outfdc--;
+		}
+		
 	}
 
-output:
 	/* produce output eventpoll entries */
-	if (!out || !outc)
-		goto out;
-
-	if (!access_ok(VERIFY_WRITE, out, outc * sizeof(struct epoll)))
-		goto fault;
-	ret = ep_poll(file->private_data, out, outc * sizeof(struct epoll),
-		      timeout, ep_send_entries);
-	goto out;
-fault:
-	ret = -EFAULT;
+	if (outfds && outfdc)
+		ret = ep_poll(file->private_data, outfds,
+			      outfdc * sizeof(struct epollfd), timeout,
+			      ep_send_entries);
+	else
+		ret = 0;
 out:
 	fput(file);
-	return ret;
+	return ret > 0 ? ret / sizeof(struct epollfd) : ret;
 }
 
 /*
@@ -2101,7 +2097,7 @@ SYSCALL_DEFINE4(epoll_wait, int, epfd, struct epoll_event __user *, events,
 
 error_fput:
 	fdput(f);
-	return error;
+	return error > 0 ? error / sizeof(struct epoll_event) : error;
 }
 
 /*

@@ -583,7 +583,7 @@ struct address_space_operations {
 	int (*is_partially_uptodate) (struct page *, read_descriptor_t *,
 					unsigned long);
 	void (*is_dirty_writeback) (struct page *, bool *, bool *);
-	int (*error_remove_page) (struct mapping *mapping, struct page *page);
+	int (*error_remove_page) (struct address_space *mapping, struct page *page);
 	int (*swap_activate)(struct file *);
 	int (*swap_deactivate)(struct file *);
 };
