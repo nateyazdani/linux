@@ -4,7 +4,7 @@
  * Copyright (C) 1999
  * Brad Boyer (flar@pants.nu)
  * (C) 2003 Ardis Technologies <roman@ardistech.com>
- * (C) 2013 Nathaniel Yazdani <n1ght.4nd.d4y@gmail.com>
+ * (C) 2014 Nathaniel Yazdani <n1ght.4nd.d4y@gmail.com>
  *
  * Format of structures on disk
  * Information taken from Apple Technote #1150 (HFS Plus Volume Format)
@@ -146,10 +146,13 @@ struct hfsplus_vh {
 #define HFSPLUS_VOL_JOURNALED		(1 << 13)
 #define HFSPLUS_VOL_SOFTLOCK		(1 << 15)
 
+extern const char HFSPLUS_JOURNAL_FILENAME[];
+extern const char HFSPLUS_JOURNAL_INFO_FILENAME[];
+
 /* HFS+ journal information block */
 struct hfsplus_jinfo {
 	__be32 flags;
-	__be32 dev_sig; /* undefined and hence ignored */
+	__be32 dev_sig; /* undefined interpretation, hence ignored */
 	__be64 offset;
 	__be64 length;
 	__be32 reserved[32];
@@ -163,12 +166,12 @@ struct hfsplus_jinfo {
 struct hfsplus_jhdr {
 	__be32 magic;
 	__be32 endian;
-	__be64 oldest;
-	__be64 newest;
-	__be64 length;
-	__be32 blist_sz; /* size of a block list, minus payload */
+	__be64 tail; /* of active buffer */
+	__be64 head; /* of active buffer */
+	__be64 length; /* of total buffer */
+	__be32 blsize; /* size of a block list, excluding payload */
 	__be32 checksum;
-	__be32 jhdr_sz; /* must equal the disk block size */
+	__be32 size; /* same as disk block size */
 } __packed;
 
 #define HFSPLUS_JHDR_MAGIC 0x4a4e4c78
@@ -178,7 +181,13 @@ struct hfsplus_jhdr {
 struct hfsplus_blent {
 	__be64 block;
 	__be32 bytes;
-	__be32 next; /* if ([0].next != 0) then multi-list */
+	__be32 chain;	/* if ([0].chain != 0) then the transaction spans
+			 * multiple block lists. Meaningless otherwise.
+			 *
+			 * In memory, this field is a relative unsigned offset
+			 * within the journal buffer to the next reference of
+			 * this block, if any.
+			 */
 } __packed;
 
 /* this value for the '.block' field indicates that the entry must be skipped */
@@ -188,9 +197,9 @@ struct hfsplus_blent {
 struct hfsplus_blhdr {
 	__be16 reserved;
 	__be16 count;
-	__be32 length; /* includes data payload(s) */
+	__be32 length; /* constant block list size plus variable payload */
 	__be32 checksum;
-	__be32 padding;
+	__be32 padding; /* in memory, recursion count of journal start/stop */
 	struct hfsplus_blent info[1]; /* first entry is special */
 } __packed;
 

@@ -218,6 +218,11 @@ static int hfsplus_file_open(struct inode *inode, struct file *file)
 		inode = HFSPLUS_I(inode)->rsrc_inode;
 	if (!(file->f_flags & O_LARGEFILE) && i_size_read(inode) > MAX_NON_LFS)
 		return -EOVERFLOW;
+	if (is_journal(inode)) {
+		if (file->f_mode & FMODE_WRITE)
+			return -EBUSY; /* no writing to the journal! */
+		file->f_op = generic_ro_fops;
+	}
 	atomic_inc(&HFSPLUS_I(inode)->opencnt);
 	return 0;
 }

@@ -303,7 +303,7 @@ int hfs_btree_write(struct hfs_btree *tree)
 	head->depth = cpu_to_be16(tree->depth);
 
 	kunmap(page);
-	hfsplus_transact_page(page);
+	hfsplus_journal_page(page);
 	hfs_bnode_put(node);
 	return 0;
 }
@@ -393,7 +393,7 @@ struct hfs_bnode *hfs_bmap_alloc(struct hfs_btree *tree)
 					if (!(byte & m)) {
 						idx += i;
 						data[off] |= m;
-						hfsplus_transact_page(*pagep);
+						hfsplus_journal_page(*pagep);
 						kunmap(*pagep);
 						tree->free_nodes--;
 						mark_inode_dirty(tree->inode);
@@ -489,7 +489,7 @@ void hfs_bmap_free(struct hfs_bnode *node)
 		return;
 	}
 	data[off] = byte & ~m;
-	hfsplus_transact_page(page);
+	hfsplus_journal_page(page);
 	kunmap(page);
 	hfs_bnode_put(node);
 	tree->free_nodes++;

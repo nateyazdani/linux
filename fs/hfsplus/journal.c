@@ -1,23 +1,21 @@
 /*
- * linux/fs/hfsplus/journal.c
+ *  linux/fs/hfsplus/journal.c
  *
- * Copyright (c) 2013, Nathaniel Yazdani <n1ght.4nd.d4y@gmail.com>
+ * Copyright (c) 2014, Nathaniel Yazdani <n1ght.4nd.d4y@gmail.com>
  *
  * HFS+ journaling infrastructure
  *
  * HFS+ records metadata I/O in an on-disk journal, which this code provides an
- * interface to. A journaled transaction begins with a call to
- * hfsplus_start_transact() (nestiing okay) and ends with
- * hfsplus_transact_stop(), which writes the transaction to the journal.
- * Between these two calls, hfsplus_transactact_page() is used to collect modified
- * pages into a single transaction. A transaction is only committed (indicated
- * as valid in the journal header) when the bi_end_io handler of a completed
- * transaction's bio is called. Currently, transactions are not tracked
- * end-to-end, so to clear the journal the entire filesystem must be synchronized.
- * The journal buffer is written until fully filled, then we wait until all
- * transactions are fully flushed.
+ * interface to. A journalled transaction begins with a call to
+ * hfsplus_journal_start() (nesting okay) and concludes with hfsplus_journal_stop(),
+ * which writes the transaction to the journal. Between these two calls, calls
+ * to hfsplus_jouranl_page() queues dirtied buffers into a single transaction,
+ * referred to as a block list. A transaction is only marked valid in the
+ * journal header after it is completely and successfully written to the
+ * journal buffer on disk (tracked with an endio routine).
  *
- * TODO: private slabs are a good idea for this code
+ * A transaction payload need only be in units of the physical sector size, and
+ * as such we use buffer heads to co-ordinate cleaning and redirtying.
  */
 
 #include <linux/types.h>
@@ -33,40 +31,38 @@
 #include "hfsplus_raw.h"
 #include "hfsplus_fs.h"
 
-
 #define offset2sector(off) ((off) >> HFSPLUS_SECTOR_SHIFT)
-#define sector2offset(sec) ((sec) << HFSPLUS_SECTOR_SHIFT)
+#define sector2offset(sect) ((sect) << HFSPLUS_SECTOR_SHIFT)
 
+/*
+ * Revised Flow:
+ * current->journal_info = blist;
+ * blist->info[1].block = bh->blocknr;
+ * blist->info[1].bytes = sb->s_blocksize;
+ * memcpy(bh->b_data, buffer);
+ * bh->b_private = &blist->info[1];
+ * bh->b_end_io = hfsplus_journal_finalize;
+ * virt_to_page(blist)->private = virt_to_page(buffer);
+ * bh->b_state |= BH_Lock; //suppress writeback; bh->b_page->flags & PG_Lock protects access
+ * atomic_inc(bh->b_count);
+ */
 
-/* in-progress journal transaction */
 struct hfsplus_transact {
-	struct super_block *sb;
-	unsigned char depth;
-	unsigned short count;
-	struct page *pages[1];
-}; /* current->journal_info */
-
-/* in-progress journal commit */
-struct hfsplus_commit {
-	struct hfsplus_blhdr *blist; /* so we can release the memory */
-	sector_t sector;
-	sector_t length;
+	unsigned char nesting;
+	unsigned short bufferc;
+	struct buffer_head *buffers;
+	struct super_block *superblock;
 };
 
-static struct hfsplus_blhdr *hfsplus_process_transact(void);
-static int hfsplus_replay_transact(struct super_block *sb,
-				 const struct hfsplus_blhdr *blist,
-				 const void *blocks);
-static int hfsplus_read_transact(struct super_block *sb,
-			       struct hfsplus_blhdr **blist,
-			       void **blocks);
-static int hfsplus_write_transact(void);
-static void hfsplus_submit_transact(struct bio *bio, bool lock);
-static void hfsplus_cancel_transact(void);
-static void hfsplus_commit_transact(struct bio *, int); /* bi_end_io */
-static void hfsplus_finish_transact(struct buffer_head *, int); /* bh_end_io */
+static struct page *hfsplus_journal_read(struct hfsplus_sb_info *sbi);
+static int hfsplus_journal_write(struct page *p);
 
-__be32 hfsplus_checksum(const void *ptr, size_t len)
+static int hfsplus_journal_replay(struct hfsplus_sb_info *sbi);
+static void hfsplus_cancel_log(void);
+static void hfsplus_commit_log(struct buffer_head *, int); /* bh_end_io */
+static void hfsplus_finish_log(struct buffer_head *, int); /* bh_end_io */
+
+static __be32 hfsplus_checksum(const void *ptr, size_t len)
 {
 	int i;
 	uint32_t res = 0;
@@ -76,9 +72,10 @@ __be32 hfsplus_checksum(const void *ptr, size_t len)
 }
 
 /*
- * Synchronize journal header. Called under journal mutex.
+ * Safely synchronize journal. TODO: clean up old block lists, then data-sync
+ * journal header, then buffer.
  */
-static int hfsplus_synch_journal(struct super_block *sb, bool wait)
+static int hfsplus_journal_sync(struct super_block *sb, bool wait)
 {
 	struct hfsplus_sb_info *sbi = HFSPLUS_SB(sb);
 	struct bio *bio;
@@ -93,8 +90,7 @@ static int hfsplus_synch_journal(struct super_block *sb, bool wait)
 		return -EIO;
 	}
 
-	sbi->journal_hdr->oldest = cpu_to_be64(sector2offset(sbi->journal_end));
-	sbi->journal_hdr->newest = cpu_to_be64(sector2offset(sbi->journal_cur));
+	sbi->journal_hdr->head = cpu_to_be64(sector2offset(sbi->journal_ptr));
 	sbi->journal_hdr->checksum = 0;
 	sbi->journal_hdr->checksum = hfsplus_checksum(sbi->journal_hdr,
 						sizeof(struct hfsplus_jhdr));
@@ -106,168 +102,229 @@ static int hfsplus_synch_journal(struct super_block *sb, bool wait)
 }
 
 /*
- * Replay any transactions remaining in the journal, called only when bringing
- * up the filesystem.
+ * Initialize and validate journaling subsystem
  */
-int hfsplus_replay_journal(struct super_block *sb)
+int hfsplus_journal_init(struct hfsplus_sb_info *sbi)
+{
+	struct hfsplus_vh *vhdr = sbi->s_vhdr;
+	struct hfsplus_jinfo *jinfo;
+	struct hfsplus_jhdr *jhdr;
+	struct page *page;
+	__be32 chksum;
+
+	/* verify journal metadata */
+	page = do_read_cache_page(sbi->journal_info->i_mapping, 0,
+				  sbi->journal_info->i_mapping->a_ops->readpage,
+				  NULL, GFP_NOFS);
+	if (!page || !(jinfo = kmap(page)))
+		return -EIO;
+	get_page(page);
+
+	/* TODO: verify journal info block extent */
+
+	page = do_read_cache_page(sbi->journal->i_mapping, 0,
+				  sbi->journal->i_mapping->a_ops->readpage,
+				  NULL, GFP_NOFS);
+	if (!page || !(jhdr = kmap(page)))
+		return -EIO;
+	get_page(page);
+
+	/* TODO: verify journal extent */
+
+	if (!(be32_to_cpu(jinfo->flags) & HFSPLUS_JINFO_INTERNAL) ||
+			be32_to_cpu(jinfo->flags) & HFSPLUS_JINFO_EXTERNAL) {
+		/* the spec. says to reject external journals */
+		pr_warn("external journal unsupported\n");
+		return -ENOSYS;
+	}
+
+	if (be32_to_cpu(jinfo->flags) & HFSPLUS_JINFO_NEED_INIT) {
+		/* initialize journal header */
+		jhdr->magic = cpu_to_be32(HFSPLUS_JHDR_MAGIC);
+		jhdr->endian = cpu_to_be32(HFSPLUS_JHDR_ENDIAN);
+		jhdr->tail = jhdr->head = cpu_to_be64(sb->s_blocksize);
+		jhdr->length = jinfo->length;
+		jhdr->blist_sz = cpu_to_be32(sb->s_blocksize);
+		jhdr->jhdr_sz = cpu_to_be32(sb->s_blocksize);
+		jhdr->checksum = 0;
+		jhdr->checksum = hfsplus_calc_chksum(jhdr,
+						sizeof(struct hfsplus_jhdr));
+		page = virt_to_page(jhdr);
+		set_page_dirty(page);
+		lock_page(page);
+		error = write_one_page(page, true);
+		if (!error) {
+			jinfo->flags ^= cpu_to_be32(HFSPLUS_JINFO_NEED_INIT);
+			page = virt_to_page(jinfo);
+			set_page_dirty(page);
+			lock_page(page);
+			error = write_one_page(page, true);
+		}
+	}
+	if (error)
+		goto err;
+
+	chksum = jhdr->checksum;
+	jhdr->checksum = 0;
+	jhdr->checksum = hfsplus_calc_chksum(jhdr, sizeof(struct hfsplus_jhdr));
+	if (jhdr->checksum != chksum
+			|| be32_to_cpu(jhdr->magic) != HFSPLUS_JHDR_MAGIC
+			|| be32_to_cpu(jhdr->endian) != HFSPLUS_JHDR_ENDIAN) {
+		/* journal header is corrupt */
+		pr_crit("corrupt journal header on %s\n", sb->s_id);
+		error = -EINVAL;
+		goto err;
+	}
+
+	sbi->journal_hdr = jhdr;
+	sbi->blcnt = (be32_to_cpu(jhdr->blsize) - sizeof(struct hfsplus_blhdr)) /
+		      sizeof(struct hfsplus_blent);
+
+	error = 0;
+	goto out;
+err:
+	page = virt_to_page(jhdr);
+	kunmap(page);
+	put_page(page);
+out:
+	/* always free journal info block mapping, since it's useless now */
+	page = virt_to_page(jinfo);
+	kunmap(page);
+	put_page(page);
+	return error;
+}
+
+/*
+ * Clean up journal
+ */
+int hfsplus_journal_exit(struct hfsplus_sb_info *sbi)
+{
+	struct page *pg;
+	int error;
+
+	error = hfsplus_journal_sync(sbi);
+
+	pg = virt_to_page(sbi->journal_hdr);
+	kunmap(pg);
+	put_page(pg);
+
+	iput(sbi->journal_info);
+	iput(sbi->journal);
+
+	return error;
+}
+
+/*
+ * Read next (tail) page from journal.
+ */
+static struct page *hfsplus_journal_read(struct hfsplus_sb_info *sbi)
+{
+	struct hfsplus_jhdr *jh = sbi->journal_hdr;
+	bool wrapa = be64_to_cpu(jh->tail) > be64_to_cpu(jh->head);
+	struct page *p;
+	p = do_read_cache_page(sbi->journal->i_mapping,
+			       (be64_to_cpu(jh->size) +
+			       	be64_to_cpu(jh->tail)) >> PAGE_CACHE_SHIFT,
+			       sbi->journal->i_mapping->a_ops->readpage,
+			       NULL, GFP_NOFS);
+	BUG_ON(be64_to_cpu(jh->tail) == be64_to_cpu(jh->head)); /* read overflow */
+	jh->tail = cpu_to_be64((be64_to_cpu(jh->tail) +
+				PAGE_CACHE_SIZE) %
+			       be64_to_cpu(jh->length));
+	return p;
+}
+
+/*
+ * Write next (head) page to journal.
+ */
+static void hfsplus_journal_write(struct hfsplus_sb_info *sbi, struct page *p)
+{
+	struct hfsplus_jhdr *jh = sbi->journal_hdr;
+	int error;
+	error = add_to_page_cache_locked(p, sbi->journal->i_mapping,
+					 (be64_to_cpu(jh->size) +
+					  be64_to_cpu(jh->head)) >>
+					 PAGE_CACHE_SHIFT, GFP_NOFS);
+	jh->head = cpu_to_be64((be64_to_cpu(jh->head) +
+				PAGE_CACHE_SIZE) %
+			       be64_to_cpu(jh->length));
+	BUG_ON(be64_to_cpu(jh->tail) == be64_to_cpu(jh->head)); /* write overflow */
+	return error;
+}
+
+/*
+ * Replay any failed transactions in the journal, called only when cleaning
+ * up a live filesystem. TODO: move to fsck.hfs
+ */
+int hfsplus_journal_replay(struct super_block *sb)
 {
 	struct hfsplus_sb_info *sbi = HFSPLUS_SB(sb);
+	struct hfsplus_jhdr *jh = sbi->journal_hdr;
 	struct hfsplus_blhdr *blist = NULL;
-	void *blocks = NULL;
+	struct bio *bio;
+	void *blocks;
+	const char *ptr;
+	uint64_t blk;
+	uint32_t len;
+	uint16_t idx;
 	int ret;
 
-	if (sbi->journal_hdr->oldest == sbi->journal_hdr->newest)
+	if (jh->tail == jh->head)
 		goto done;
 
-	if (be64_to_cpu(sbi->journal_hdr->oldest) % sb->s_blocksize) {
+	if (be64_to_cpu(jh->tail) % sb->s_blocksize) {
 		pr_crit("ill-aligned journal on %s\n", sb->s_id);
 		return -EINVAL;
 	}
 
 	pr_info("replaying journal on %s\n", sb->s_id);
-	while (sbi->journal_hdr->oldest != sbi->journal_hdr->newest) {
+	while (jh->tail != jh->head) {
 
-		ret = hfsplus_read_transact(sb, &blist, &blocks);
-		if (!ret)
-			return -ENOMEM;
+		blist = kmap(hfsplus_journal_read(sbi));
 
-		ret = hfsplus_replay_transact(sb, blist, blocks);
+		for (idx = 1; idx < be16_to_cpu(blist->count); ++idx) {
+
+			blk = be64_to_cpu(blist->info[idx].block);
+			len = be32_to_cpu(blist->info[idx].bytes);
+			if (!len || blk == HFSPLUS_BLENT_SKIP)
+				continue;
+
+			bio = bio_alloc(GFP_NOFS, 1);
+			bio->bi_bdev = sb->s_bdev;
+			bio->bi_iter.bi_sector = blk << HFSPLUS_SB(sb)->blockoffset;
+
+			error = -EIO;
+			if (len != bio_add_page(bio, virt_to_page(ptr), len,
+						(loff_t)ptr % PAGE_SIZE))
+				goto err;
+
+			error = submit_bio_wait(WRITE_SYNC, bio);
+			if (error)
+				goto err;
+
+			bio_put(bio);
+			ptr += len;
+		}
 		kfree(blist);
 		kfree(blocks);
 
 		/* try to update journal header (not critical) */
-		hfsplus_synch_journal(sb, false);
+		hfsplus_journal_sync(sb, false);
 	}
 
 done:
-	return hfsplus_synch_journal(sb, true);
-}
-
-static int hfsplus_replay_transact(struct super_block *sb,
-				 const struct hfsplus_blhdr *blist,
-				 const void *blocks)
-{
-	struct bio *bio;
-	const char *ptr = blocks;
-	uint64_t blk;
-	uint32_t len;
-	uint16_t idx;
-	int error;
-
-	/* iterate over every block entry of the transaction except the first */
-	for (idx = 1; idx < be16_to_cpu(blist->count); ++idx) {
-
-		blk = be64_to_cpu(blist->info[idx].block);
-		len = be32_to_cpu(blist->info[idx].bytes);
-		if (!len || blk == HFSPLUS_BLENT_SKIP)
-			continue;
-
-		bio = bio_alloc(GFP_NOFS, 1);
-		bio->bi_bdev = sb->s_bdev;
-		bio->bi_iter.bi_sector = blk << HFSPLUS_SB(sb)->blockoffset;
-
-		error = -EIO;
-		if (len != bio_add_page(bio, virt_to_page(ptr), len,
-					(loff_t)ptr % PAGE_SIZE))
-			goto err;
-
-		error = submit_bio_wait(WRITE_SYNC, bio);
-		if (error)
-			goto err;
-
-		bio_put(bio);
-		ptr += len;
-	}
-	return 0;
-
-err:
-	bio_put(bio);
-	return error;
-}
-
-/*
- * Synchronously read a record, starting at sbi->journal_end, wrapping
- * around if necessary. All memory is kmalloc()ed.
- */
-static int hfsplus_read_transact(struct super_block *sb,
-			       struct hfsplus_blhdr **blist,
-			       void **blocks)
-{
-	struct hfsplus_sb_info *sbi = HFSPLUS_SB(sb);
-	struct bio *bio = NULL;
-	void *ptr;
-	size_t cur, len;
-	int error = 0;
-
-	if (!blist || !blocks)
-		return -EINVAL;
-
-	*blist = NULL;
-	*blocks = NULL;
-
-	/* first read in block list */
-	len = sbi->blist_len;
-
-read:
-	ptr = kmalloc(len, GFP_NOFS);
-	error = -ENOMEM;
-	if (!ptr)
-		goto err;
-	cur = min_t(size_t, len, sector2offset(sbi->journal_buf +
-					sbi->journal_len - sbi->journal_end));
-
-	do {
-		len -= cur;
-		bio = bio_alloc(GFP_NOFS, 1);
-		bio->bi_bdev = sb->s_bdev;
-		bio->bi_iter.bi_sector = sbi->journal_end;
-		bio->bi_iter.bi_size = (unsigned int)cur;
-
-		error = -EIO;
-		if (bio_add_page(bio, virt_to_page(ptr), cur,
-						(loff_t)ptr % PAGE_SIZE) != cur)
-			goto err;
-		if (submit_bio_wait(READ_SYNC, bio))
-			goto err;
-
-		bio_put(bio);
-
-
-		cur = len;
-	} while (cur);
-
-	/* determine whether we need to wrap around */
-	if (*blist == NULL) {
-		*blist = ptr;
-		/* advance sbi->journal_end, potentially wrapping around */
-		len = be32_to_cpu((*blist)->length);
-		sbi->journal_end += len;
-		sbi->journal_end %= sbi->journal_len;
-		len -= sbi->blist_len; /* we already read in the block list */
-		goto read;
-	}
-	*blocks = ptr;
-	return 0;
-
-err:
-	if (*blist)
-		kfree(*blist);
-	if (*blocks)
-		kfree(*blocks);
-	if (bio)
-		bio_put(bio);
-	return error;
+	return hfsplus_journal_sync(sb, true);
 }
 
 /*
  * Begin recording a transaction.
  */
-int hfsplus_start_transact(struct super_block *sb)
+int hfsplus_journal_start(struct super_block *sb)
 {
 	struct hfsplus_transact *trans = current->journal_info;
 
-	if (!HFSPLUS_SB(sb)->journaling)
-		return -ENOSYS; /* journaling disabled */
+	if (!is_journaled(sb))
+		return 0; /* journaling disabled */
 
 	if (trans) {
 		trans->depth++;
@@ -277,132 +334,70 @@ int hfsplus_start_transact(struct super_block *sb)
 	current->journal_info = trans = kmalloc(sizeof *trans, GFP_NOFS);
 	if (unlikely(!trans))
 		return -ENOMEM;
-	trans->sb = sb;
-	trans->depth = 0;
-	trans->count = 0;
+	trans->nesting = 0;
+	trans->superblock = sb;
+	trans->bufferc = 0;
+	trans->buffers = NULL;
 	return 0;
 }
 
 /*
- * Queue a dirtied page (locking it as well) in the ongoing transaction, to be
- * synched after it's been recorded in the journal, _if_ journaling is active.
+ * Queue dirtied buffers (locking them as well) in the ongoing transaction, to be
+ * synched after it's been recorded in the journal, if journaling is active.
  */
-int hfsplus_transact_page(struct page *page)
+int hfsplus_journal_page(struct page *page, off_t off, size_t len)
 {
-	struct hfsplus_transact *trans = current->journal_info, *retrans;
-	size_t size;
-
 	set_page_dirty(page);
 
 	if (!trans)
 		return 0;
 
-	if (trans->sb != page->mapping->host->i_sb)
+	if (trans->superblock != page->mapping->host->i_sb)
 		return -EINVAL;
 
-	size = ksize(trans);
-	if (size < sizeof(*trans) + sizeof(page) * (trans->count)) {
-		retrans = kmalloc(size + sizeof(page), GFP_NOFS);
-		if (!retrans)
-			return -ENOMEM;
-		memcpy(trans, retrans, size);
-		current->journal_info = retrans;
-		kfree(trans);
-	}
-
-	lock_page(page); /* can't let any other context touch this page */
-	trans->pages[trans->count++] = page;
 	return 0;
+}
+
+int hfsplus_journal_buffer(struct buffer_head *bh)
+{
+	struct hfsplus_transact *trans = current->journal_info;
+
+	if (!is_journaled(sb))
+		return 0;
+
+
+	BUG_ON(trans->);
 }
 
 /*
  * Either cancel or commit the record depending on the success of the operation.
  */
-int hfsplus_stop_transact(int error)
+int hfsplus_journal_stop(void)
 {
-	if (!current->journal_info)
-		return error ? -EINVAL : error;
-
-	if (!error)
-		error = hfsplus_write_transact();
-	else
-		hfsplus_cancel_transact();
-
-	return error;
-}
-
-/*
- * Cancel the currently active transaction.
- */
-static void hfsplus_cancel_transact(void)
-{
+	struct hfsplus_sb_info *sbi = HFSPLUS_SB(trans->superblock);
 	struct hfsplus_transact *trans = current->journal_info;
+	struct hfsplus_blhdr *blist;
+	struct buffer_head *bh;
+	uint64_t block;
+	uint32_t bytes;
+	unsigned dst, src = 0;
 
-	if (trans->depth) {
-		/* give callers a chance to try to recover */
-		trans->depth--;
-		return;
-	}
+	if (!is_journaled(trans->superblock))
+		return 0;
 
-	current->journal_info = NULL;
-	while (trans->count--)
-		unlock_page(trans->pages[trans->count]);
-	kfree(trans);
-	return;
-}
-
-/*
- * Write the completed transaction to the journal on disk, chaining writeback
- * of recorded pages on completion. On error, pages are flagges as dirty and
- * unlocked, meaning that they will be journaled but possibly not in order.
- */
-static int hfsplus_write_transact(void)
-{
-	struct hfsplus_transact *trans = current->journal_info;
-	struct bio *bio = NULL;
-	int i, error = 0;
+	BUG_ON(!trans);
 
 	if (trans->depth) {
 		trans->depth--;
 		return 0;
 	}
 
-	if (!trans->count)
-		return 0;
-
-	/* initialize bio */
-	bio = bio_alloc(GFP_NOFS, 1 + trans->count);
-	bio->bi_bdev = trans->sb->s_bdev;
-	bio->bi_end_io = hfsplus_commit_transact;
-	/* hfsplus_submit_transact() wants this */
-	bio->bi_private = hfsplus_process_transact();
-
-	error = -ENOMEM;
-	if (!bio->bi_private)
-		goto err;
-
-	error = -EIO;
-	i = HFSPLUS_SB(trans->sb)->blist_len; /* borrow i for a moment */
-	if (bio_add_page(bio, virt_to_page(bio->bi_private), i,
-				(off_t)bio->bi_private % PAGE_SIZE) != i)
-		goto err;
-	for (i = 0; i < trans->count; ++i)
-		if (bio_add_page(bio, trans->pages[i], PAGE_SIZE, 0) != PAGE_SIZE)
-			goto err;
-
-	hfsplus_submit_transact(bio, true);
-	error = 0;
-	goto out;
-	
-err:
-	while (trans->count--)
-		set_bit(PG_error, &trans->pages[trans->count]->flags);
-
-	kfree(bio->bi_private);
-out:
 	current->journal_info = NULL;
+	for (bh = trans->buffers; bh; bh = bh->private)
+		;
+
 	kfree(trans);
-	return error;
+	return 0;
 }
 
 /*
@@ -434,7 +429,6 @@ static void hfsplus_submit_transact(struct bio *bio, bool lock)
 	sbi->journal_ptr %= sbi->journal_ptr;
 
 	/* store info needed by hfsplus_commit_transact() */
-	comm->sector = bio->bi_iter.bi_sector;
 	comm->length = bio_sectors(bio);
 	comm->blist = bio->bi_private;
 	bio->bi_private = comm;
@@ -456,7 +450,6 @@ static void hfsplus_submit_transact(struct bio *bio, bool lock)
 	if (sbi->journal_bio == bio)
 		sbi->journal_bio = bio->bi_next;
 
-	comm->sector = bio->bi_iter.bi_sector;
 	submit_bio(WRITE, bio);
 	bio_put(bio);
 
@@ -470,15 +463,6 @@ out:
 static struct hfsplus_blhdr *hfsplus_process_transact(void)
 {
 	struct hfsplus_transact *trans = current->journal_info;
-	struct hfsplus_sb_info *sbi = HFSPLUS_SB(trans->sb);
-	struct hfsplus_blhdr *blist;
-	uint64_t block;
-	uint32_t bytes;
-	unsigned dst, src = 0;
-
-	/* if a transactions is this huge, something went very wrong */
-	BUG_ON((trans->count << PAGE_SHIFT) + sbi->blist_len >
-					sector2offset(sbi->journal_len));
 
 	blist = kzalloc(sbi->blist_len, GFP_NOFS);
 	if (!blist)
@@ -496,7 +480,7 @@ static struct hfsplus_blhdr *hfsplus_process_transact(void)
 		/* try to coalesce with the previous entry */
 		bytes = be32_to_cpu(blist->info[dst - 1].bytes);
 		block = be64_to_cpu(blist->info[dst - 1].block) +
-					(bytes >> trans->sb->s_blocksize_bits);
+					(bytes >> trans->superblock->s_blocksize_bits);
 		if (block == be64_to_cpu(blist->info[dst].block))
 			blist->info[dst - 1].bytes = cpu_to_be32(bytes + PAGE_SIZE);
 		else
@@ -523,8 +507,7 @@ static void hfsplus_commit_transact(struct bio *bio, int err) /* bi_end_io */
 	struct hfsplus_sb_info *sbi = HFSPLUS_SB(bio->bi_bdev->bd_super);
 	struct writeback_control wbc = { };
 	struct hfsplus_commit *comm = bio->bi_private;
-	struct bvec_iter bi = { .bi_sector = comm->sector,
-				.bi_size = sector2offset(comm->length) };
+	struct bvec_iter bi = { .bi_size = sector2offset(comm->length) };
 	struct bio_vec bv;
 
 	if (err) {
@@ -549,7 +532,7 @@ static void hfsplus_commit_transact(struct bio *bio, int err) /* bi_end_io */
 	 */
 	mutex_lock(&sbi->journal_mtx);
 	sbi->journal_cur += offset2sector(bi.bi_size + sbi->blist_len);
-	sbi->journal_hdr->newest = cpu_to_be64(sector2offset(sbi->journal_cur));
+	sbi->journal_hdr->head = cpu_to_be64(sector2offset(sbi->journal_cur));
 	sbi->journal_hdr->checksum = 0;
 	sbi->journal_hdr->checksum = hfsplus_checksum(sbi->journal_hdr,
 						sizeof(struct hfsplus_jhdr));
@@ -568,6 +551,8 @@ static void hfsplus_commit_transact(struct bio *bio, int err) /* bi_end_io */
 
 /* 
  * Advance sbi->journal_fin & check if the journal can be cleared
+ * FIXME: way better idea; just flag finalized transactions payloads as
+ * skippable, then replay journal, doing nothing.
  */
 static void hfsplus_finish_transact(struct buffer_head *bh, int uptodate)
 {
@@ -590,7 +575,7 @@ static void hfsplus_finish_transact(struct buffer_head *bh, int uptodate)
 		sbi->journal_cur = 0;
 		sbi->journal_fin = 0;
 		/* update journal header */
-		hfsplus_synch_journal(bh->b_bdev->bd_super, false);
+		hfsplus_sync_journal(bh->b_bdev->bd_super, false);
 		/* now submit queued transactions */
 		for (bio = sbi->journal_bio; bio; bio = bio->bi_next)
 			hfsplus_submit_transact(bio, false);

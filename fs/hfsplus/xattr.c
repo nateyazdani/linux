@@ -185,7 +185,7 @@ check_attr_tree_state_again:
 						    sbi->sect_count,
 						    HFSPLUS_ATTR_CNID);
 
-	hfsplus_start_transact(sb);
+	hfsplus_journal_start(sb);
 	mutex_lock(&hip->extents_lock);
 	hip->clump_blocks = clump_size >> sbi->alloc_blksz_shift;
 	mutex_unlock(&hip->extents_lock);
@@ -234,7 +234,7 @@ check_attr_tree_state_again:
 			min_t(size_t, PAGE_CACHE_SIZE, node_size - written));
 		kunmap_atomic(kaddr);
 
-		hfsplus_transact_page(page);
+		hfsplus_journal_page(page);
 		page_cache_release(page);
 	}
 
@@ -257,7 +257,7 @@ end_attr_file_creation:
 	else
 		atomic_set(&sbi->attr_tree_state, HFSPLUS_FAILED_ATTR_TREE);
 
-	return hfsplus_stop_transact(err);
+	return hfsplus_journal_stop(err);
 }
 
 int __hfsplus_setxattr(struct inode *inode, const char *name,
@@ -286,7 +286,7 @@ int __hfsplus_setxattr(struct inode *inode, const char *name,
 		return err;
 	}
 
-	hfsplus_start_transact(inode->i_sb);
+	hfsplus_journal_start(inode->i_sb);
 	err = hfsplus_find_cat(inode->i_sb, inode->i_ino, &cat_fd);
 	if (err) {
 		pr_err("catalog searching failed\n");
@@ -394,7 +394,7 @@ int __hfsplus_setxattr(struct inode *inode, const char *name,
 
 end_setxattr:
 	hfs_find_exit(&cat_fd);
-	return hfsplus_stop_transact(err);
+	return hfsplus_journal_stop(err);
 }
 
 static int name_len(const char *xattr_name, int xattr_name_len)
@@ -745,7 +745,7 @@ static int hfsplus_removexattr(struct inode *inode, const char *name)
 		return err;
 	}
 
-	hfsplus_start_transact(inode->i_sb);
+	hfsplus_journal_start(inode->i_sb);
 	err = hfsplus_find_cat(inode->i_sb, inode->i_ino, &cat_fd);
 	if (err) {
 		pr_err("catalog searching failed\n");
@@ -794,7 +794,7 @@ static int hfsplus_removexattr(struct inode *inode, const char *name)
 
 end_removexattr:
 	hfs_find_exit(&cat_fd);
-	return hfsplus_stop_transact(err);
+	return hfsplus_journal_stop(err);
 }
 
 static int hfsplus_osx_getxattr(struct dentry *dentry, const char *name,

@@ -160,20 +160,10 @@ struct hfsplus_sb_info {
 	sector_t sect_count;
 	int fs_shift;
 
-	/* Journaling */
-	bool journaling;
-	struct mutex journal_mtx; /* serializes writes to journal & offsets */
-	struct hfsplus_jhdr *journal_hdr; /* always consistent with disk */
-	struct bio *journal_bio; /* queue when flushing */
-	sector_t journal; /* always exactly one block before '->journal_buf' */
-	sector_t journal_buf;
-	sector_t journal_len;
-	sector_t journal_ptr; /* allocated space */
-	sector_t journal_cur; /* written space */
-	sector_t journal_fin; /* transacted space */
-	sector_t journal_end;
-	uint32_t blist_len; /* constant size of a block list */
-	uint16_t blist_num; /* constant length of a block list */
+	struct inode *journal_info;
+	struct inode *journal;
+	struct hfsplus_jhdr *journal_hdr; /* kmap()ed page */
+	unsigned short blcnt; /* number of entries in a block list */
 
 	/* immutable data from the volume header */
 	u32 alloc_blksz;
@@ -217,6 +207,16 @@ struct hfsplus_sb_info {
 static inline struct hfsplus_sb_info *HFSPLUS_SB(struct super_block *sb)
 {
 	return sb->s_fs_info;
+}
+
+static inline bool is_journal_inode(struct inode *inode) {
+	return inode == HFSPLUS_SB(inode->i_sb)->journal ||
+	       inode == HFSPLUS_SB(inode->i_sb)->journal_info_block;
+}
+
+static inline bool is_journaled(struct hfsplus_sb_info *sbi)
+{
+	return sbi->journal != NULL;
 }
 
 
@@ -499,12 +499,13 @@ sector_t hfsplus_bmap(struct address_space *mapping, sector_t block);
 long hfsplus_ioctl(struct file *filp, unsigned int cmd, unsigned long arg);
 
 /* journal.c */
-__be32 hfsplus_calc_chksum(const void *ptr, size_t len);
-int hfsplus_create_journal(struct super_block *sb);
-int hfsplus_replay_journal(struct super_block *sb);
-int hfsplus_start_transact(struct super_block *sb);
-int hfsplus_stop_transact(int err);
-int hfsplus_transact_page(struct page *page);
+int hfsplus_journal_init(struct super_block *sb);
+int hfsplus_journal_exit(struct super_block *sb);
+int hfsplus_journal_replay(struct super_block *sb);
+int hfsplus_journal_start(struct super_block *sb);
+int hfsplus_journal_stop(void);
+int hfsplus_journal_page(struct page *page, loff_t off, size_t len);
+int hfsplus_journal_buffer(struct buffer_head *bh);
 
 /* options.c */
 int hfsplus_parse_options(char *, struct hfsplus_sb_info *);
@@ -536,7 +537,6 @@ int hfsplus_compare_dentry(const struct dentry *parent, const struct dentry *den
 
 /* wrapper.c */
 int hfsplus_load_super(struct super_block *);
-int hfsplus_load_journal(struct super_block *);
 int hfs_part_find(struct super_block *, sector_t *, sector_t *);
 int hfsplus_submit_bio(struct super_block *sb, sector_t sector, void *buf,
 							void **data, int rw);

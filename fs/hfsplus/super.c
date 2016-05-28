@@ -145,7 +145,7 @@ static int hfsplus_write_inode(struct inode *inode,
 {
 	int err;
 
-	hfsplus_start_transact(inode->i_sb);
+	hfsplus_journal_start(inode->i_sb);
 	hfs_dbg(INODE, "hfsplus_write_inode: %lu\n", inode->i_ino);
 
 	err = hfsplus_ext_write_extent(inode);
@@ -158,12 +158,12 @@ static int hfsplus_write_inode(struct inode *inode,
 	else
 		err = hfsplus_system_write_inode(inode);
 out:
-	return hfsplus_stop_transact(err);
+	return hfsplus_journal_stop(err);
 }
 
 static void hfsplus_evict_inode(struct inode *inode)
 {
-	hfsplus_start_transact(inode->i_sb);
+	hfsplus_journal_start(inode->i_sb);
 	hfs_dbg(INODE, "hfsplus_evict_inode: %lu\n", inode->i_ino);
 	truncate_inode_pages(&inode->i_data, 0);
 	clear_inode(inode);
@@ -171,7 +171,7 @@ static void hfsplus_evict_inode(struct inode *inode)
 		HFSPLUS_I(HFSPLUS_I(inode)->rsrc_inode)->rsrc_inode = NULL;
 		iput(HFSPLUS_I(inode)->rsrc_inode);
 	}
-	hfsplus_stop_transact(0);
+	hfsplus_journal_stop(0);
 }
 
 static int hfsplus_sync_fs(struct super_block *sb, int wait)
@@ -452,20 +452,6 @@ static int hfsplus_fill_super(struct super_block *sb, void *data, int silent)
 	sb->s_op = &hfsplus_sops;
 	sb->s_maxbytes = MAX_LFS_FILESIZE;
 
-	if (!(vhdr->attributes & cpu_to_be32(HFSPLUS_VOL_UNMNT))) {
-		pr_warn("Filesystem was not cleanly unmounted, running fsck.hfsplus is recommended.  mounting read-only.\n");
-		sb->s_flags |= MS_RDONLY;
-	} else if (test_and_clear_bit(HFSPLUS_SB_FORCE, &sbi->flags)) {
-		/* nothing */
-	} else if (vhdr->attributes & cpu_to_be32(HFSPLUS_VOL_SOFTLOCK)) {
-		pr_warn("Filesystem is marked locked, mounting read-only.\n");
-		sb->s_flags |= MS_RDONLY;
-	} else if ((vhdr->attributes & cpu_to_be32(HFSPLUS_VOL_JOURNALED)) &&
-			!(sb->s_flags & MS_RDONLY)) {
-		pr_warn("write access to a journaled filesystem is not supported, use the force option at your own risk, mounting read-only.\n");
-		sb->s_flags |= MS_RDONLY;
-	}
-
 	err = -EINVAL;
 
 	/* Load metadata objects (B*Trees) */
@@ -529,8 +515,65 @@ static int hfsplus_fill_super(struct super_block *sb, void *data, int silent)
 			goto out_put_root;
 		}
 		sbi->hidden_dir = inode;
-	} else
+	} else {
 		hfs_find_exit(&fd);
+	}
+
+	if (test_and_clear_bit(HFSPLUS_SB_FORCE, &sbi->flags)) {
+		/* nothing */
+	} else if (vhdr->attributes & cpu_to_be32(HFSPLUS_VOL_SOFTLOCK)) {
+		pr_warn("Filesystem is marked locked, mounting read-only.\n");
+		sb->s_flags |= MS_RDONLY;
+	} else if ((vhdr->attributes & cpu_to_be32(HFSPLUS_VOL_JOURNALED)) &&
+			!(sb->s_flags & MS_RDONLY)) {
+
+		str.name = HFSPLUS_JOURNAL_INFO_FILENAME;
+		str.len = sizeof(HFSPLUS_JOURNAL_INFO_FILENAME) - 1;
+		err = hfs_find_init(sbi->cat_tree, &fd);
+		if (err)
+			goto out_put_hidden_dir;
+		hfsplus_cat_build_key(sb, fd.search_key, HFSPLUS_ROOT_CNID, &str);
+		if (!hfs_brec_read(&fd, &entry, sizeof(entry))) {
+			hfs_find_exit(&fd);
+			if (entry.type != cpu_to_be16(HFSPLUS_FILE))
+				goto out_put_hidden_dir;
+			inode = hfsplus_iget(sb, be32_to_cpu(entry.file.id));
+			if (IS_ERR(inode)) {
+				err = PTR_ERR(inode);
+				goto out_put_hidden_dir;
+			}
+			sbi->journal_info = inode;
+		} else {
+			hfs_find_exit(&fd);
+		}
+
+		str.name = HFSPLUS_JOURNAL_FILENAME;
+		str.len = sizeof(HFSPLUS_JOURNAL_FILENAME) - 1;
+		err = hfs_find_init(sbi->cat_tree, &fd);
+		if (err)
+			goto out_put_journal_info;
+		hfsplus_cat_build_key(sb, fd.search_key, HFSPLUS_ROOT_CNID, &str);
+		if (!hfs_brec_read(&fd, &entry, sizeof(entry))) {
+			hfs_find_exit(&fd);
+			if (entry.type != cpu_to_be16(HFSPLUS_FILE))
+				goto out_put_journal_info;
+			inode = hfsplus_iget(sb, be32_to_cpu(entry.file.id));
+			if (IS_ERR(inode)) {
+				err = PTR_ERR(inode);
+				goto out_put_journal_info;
+			}
+			sbi->journal = inode;
+		} else {
+			hfs_find_exit(&fd);
+		}
+
+		hfsplus_journal_init(sbi);
+		if (!(vhdr->attributes & cpu_to_be32(HFSPLUS_VOL_UNMNT)))
+			hfsplus_journal_replay(sb);
+	} else if (!(vhdr->attributes & cpu_to_be32(HFSPLUS_VOL_UNMNT))) {
+		pr_warn("Filesystem was not cleanly unmounted, running fsck.hfsplus is recommended.  mounting read-only.\n");
+		sb->s_flags |= MS_RDONLY;
+	}
 
 	if (!(sb->s_flags & MS_RDONLY)) {
 		/*
@@ -550,13 +593,13 @@ static int hfsplus_fill_super(struct super_block *sb, void *data, int silent)
 			if (!sbi->hidden_dir) {
 				mutex_unlock(&sbi->vh_mutex);
 				err = -ENOMEM;
-				goto out_put_root;
+				goto out_put_journal;
 			}
 			err = hfsplus_create_cat(sbi->hidden_dir->i_ino, root,
 						 &str, sbi->hidden_dir);
 			if (err) {
 				mutex_unlock(&sbi->vh_mutex);
-				goto out_put_hidden_dir;
+				goto out_put_journal;
 			}
 
 			err = hfsplus_init_inode_security(sbi->hidden_dir,
@@ -571,7 +614,7 @@ static int hfsplus_fill_super(struct super_block *sb, void *data, int silent)
 				hfsplus_delete_cat(sbi->hidden_dir->i_ino,
 							root, &str);
 				mutex_unlock(&sbi->vh_mutex);
-				goto out_put_hidden_dir;
+				goto out_put_journal;
 			}
 
 			mutex_unlock(&sbi->vh_mutex);
@@ -584,6 +627,10 @@ static int hfsplus_fill_super(struct super_block *sb, void *data, int silent)
 	sbi->nls = nls;
 	return 0;
 
+out_put_journal:
+	iput(sbi->journal);
+out_put_journal_info:
+	iput(sbi->journal_info);
 out_put_hidden_dir:
 	iput(sbi->hidden_dir);
 out_put_root:

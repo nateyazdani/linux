@@ -278,7 +278,7 @@ static int hfsplus_link(struct dentry *src_dentry, struct inode *dst_dir,
 	if (!S_ISREG(inode->i_mode))
 		return -EPERM;
 
-	hfsplus_start_transact(inode->i_sb);
+	hfsplus_journal_start(inode->i_sb);
 	mutex_lock(&sbi->vh_mutex);
 	if (inode->i_ino == (u32)(unsigned long)src_dentry->d_fsdata) {
 		for (;;) {
@@ -318,7 +318,7 @@ static int hfsplus_link(struct dentry *src_dentry, struct inode *dst_dir,
 	hfsplus_mark_mdb_dirty(dst_dir->i_sb);
 out:
 	mutex_unlock(&sbi->vh_mutex);
-	return hfsplus_stop_transact(res);
+	return hfsplus_journal_stop(res);
 }
 
 static int hfsplus_unlink(struct inode *dir, struct dentry *dentry)
@@ -333,7 +333,7 @@ static int hfsplus_unlink(struct inode *dir, struct dentry *dentry)
 	if (HFSPLUS_IS_RSRC(inode))
 		return -EPERM;
 
-	hfsplus_start_transact(dir->i_sb);
+	hfsplus_journal_start(dir->i_sb);
 	mutex_lock(&sbi->vh_mutex);
 	cnid = (u32)(unsigned long)dentry->d_fsdata;
 	if (inode->i_ino == cnid &&
@@ -376,7 +376,7 @@ static int hfsplus_unlink(struct inode *dir, struct dentry *dentry)
 	mark_inode_dirty(inode);
 out:
 	mutex_unlock(&sbi->vh_mutex);
-	return hfsplus_stop_transact(res);
+	return hfsplus_journal_stop(res);
 }
 
 static int hfsplus_rmdir(struct inode *dir, struct dentry *dentry)
@@ -388,7 +388,7 @@ static int hfsplus_rmdir(struct inode *dir, struct dentry *dentry)
 	if (inode->i_size != 2)
 		return -ENOTEMPTY;
 
-	hfsplus_start_transact(dir->i_sb);
+	hfsplus_journal_start(dir->i_sb);
 
 	mutex_lock(&sbi->vh_mutex);
 	res = hfsplus_delete_cat(inode->i_ino, dir, &dentry->d_name);
@@ -400,7 +400,7 @@ static int hfsplus_rmdir(struct inode *dir, struct dentry *dentry)
 	mark_inode_dirty(inode);
 out:
 	mutex_unlock(&sbi->vh_mutex);
-	return hfsplus_stop_transact(res);
+	return hfsplus_journal_stop(res);
 }
 
 static int hfsplus_symlink(struct inode *dir, struct dentry *dentry,
@@ -410,7 +410,7 @@ static int hfsplus_symlink(struct inode *dir, struct dentry *dentry,
 	struct inode *inode;
 	int res = -ENOSPC;
 
-	hfsplus_start_transact(dir->i_sb);
+	hfsplus_journal_start(dir->i_sb);
 	mutex_lock(&sbi->vh_mutex);
 	inode = hfsplus_new_inode(dir->i_sb, S_IFLNK | S_IRWXUGO);
 	if (!inode)
@@ -443,7 +443,7 @@ out_err:
 	iput(inode);
 out:
 	mutex_unlock(&sbi->vh_mutex);
-	return hfsplus_stop_transact(res);
+	return hfsplus_journal_stop(res);
 }
 
 static int hfsplus_mknod(struct inode *dir, struct dentry *dentry,
@@ -453,7 +453,7 @@ static int hfsplus_mknod(struct inode *dir, struct dentry *dentry,
 	struct inode *inode;
 	int res = -ENOSPC;
 
-	hfsplus_start_transact(dir->i_sb);
+	hfsplus_journal_start(dir->i_sb);
 	mutex_lock(&sbi->vh_mutex);
 	inode = hfsplus_new_inode(dir->i_sb, mode);
 	if (!inode)
@@ -485,7 +485,7 @@ failed_mknod:
 	iput(inode);
 out:
 	mutex_unlock(&sbi->vh_mutex);
-	return hfsplus_stop_transact(res);
+	return hfsplus_journal_stop(res);
 }
 
 static int hfsplus_create(struct inode *dir, struct dentry *dentry, umode_t mode,
@@ -504,7 +504,7 @@ static int hfsplus_rename(struct inode *old_dir, struct dentry *old_dentry,
 {
 	int res;
 
-	hfsplus_start_transact(new_dir->i_sb);
+	hfsplus_journal_start(new_dir->i_sb);
 	/* Unlink destination if it already exists */
 	if (new_dentry->d_inode) {
 		if (S_ISDIR(new_dentry->d_inode->i_mode))
@@ -512,7 +512,7 @@ static int hfsplus_rename(struct inode *old_dir, struct dentry *old_dentry,
 		else
 			res = hfsplus_unlink(new_dir, new_dentry);
 		if (res)
-			return hfsplus_stop_transact(res);
+			return hfsplus_journal_stop(res);
 	}
 
 	res = hfsplus_rename_cat((u32)(unsigned long)old_dentry->d_fsdata,
@@ -520,7 +520,7 @@ static int hfsplus_rename(struct inode *old_dir, struct dentry *old_dentry,
 				 new_dir, &new_dentry->d_name);
 	if (!res)
 		new_dentry->d_fsdata = old_dentry->d_fsdata;
-	return hfsplus_stop_transact(res);
+	return hfsplus_journal_stop(res);
 }
 
 const struct inode_operations hfsplus_dir_inode_operations = {
